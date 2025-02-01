@@ -2,28 +2,21 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "bucket/Bucket.h"
-#include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
-#include "bucket/BucketManagerImpl.h"
-#include "bucket/LedgerCmp.h"
+#include "bucket/test/BucketTestUtils.h"
 #include "crypto/SHA.h"
 #include "herder/HerderImpl.h"
-#include "herder/LedgerCloseData.h"
 #include "ledger/LedgerManager.h"
 #include "ledger/test/LedgerTestUtils.h"
 #include "lib/catch.hpp"
 #include "lib/util/stdrandom.h"
 #include "main/Application.h"
 #include "medida/stats/snapshot.h"
-#include "overlay/StellarXDR.h"
 #include "simulation/Topologies.h"
 #include "test/test.h"
 #include "transactions/TransactionFrame.h"
 #include "util/Logging.h"
 #include "util/Math.h"
-#include "util/types.h"
-#include "xdrpp/autocheck.h"
 #include <fmt/format.h>
 #include <sstream>
 
@@ -253,7 +246,7 @@ TEST_CASE("resilience tests", "[resilience][simulation][!hide]")
 
     auto confGen = [](int configNum) -> Config {
         // we have to have persistent nodes as we want to simulate a restart
-        auto c = getTestConfig(configNum, Config::TESTDB_ON_DISK_SQLITE);
+        auto c = getTestConfig(configNum, Config::TESTDB_BUCKET_DB_PERSISTENT);
         return c;
     };
 
@@ -395,8 +388,9 @@ TEST_CASE(
     auto& app = *nodes[0]; // pick a node to generate load
 
     auto& loadGen = app.getLoadGenerator();
-    loadGen.generateLoad(LoadGenMode::CREATE, 3, 0, 0, 10, 100,
-                         std::chrono::seconds(0), 0);
+    loadGen.generateLoad(GeneratedLoadConfig::createAccountsLoad(
+        /* nAccounts */ 3,
+        /* txRate */ 10));
     try
     {
         simulation->crankUntil(
@@ -409,8 +403,8 @@ TEST_CASE(
             },
             3 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
-        loadGen.generateLoad(LoadGenMode::PAY, 3, 0, 10, 10, 100,
-                             std::chrono::seconds(0), 0);
+        loadGen.generateLoad(
+            GeneratedLoadConfig::txLoad(LoadGenMode::PAY, 3, 10, 10));
         simulation->crankUntil(
             [&]() {
                 return simulation->haveAllExternalized(8, 2) &&
@@ -434,7 +428,7 @@ newLoadTestApp(VirtualClock& clock)
 #ifdef USE_POSTGRES
         !force_sqlite ? getTestConfig(0, Config::TESTDB_POSTGRESQL) :
 #endif
-                      getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE);
+                      getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT);
     cfg.RUN_STANDALONE = false;
     // force maxTxSetSize to avoid throwing txSets on the floor during the first
     // ledger close
@@ -523,8 +517,9 @@ TEST_CASE("Accounts vs latency", "[scalability][!hide]")
     uint32_t numItems = 500000;
 
     // Create accounts
-    loadGen.generateLoad(LoadGenMode::CREATE, numItems, 0, 0, 10, 100,
-                         std::chrono::seconds(0), 0);
+    loadGen.generateLoad(GeneratedLoadConfig::createAccountsLoad(
+        /* nAccounts */ 10,
+        /* txRate */ 10));
 
     auto& complete =
         appPtr->getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
@@ -539,8 +534,8 @@ TEST_CASE("Accounts vs latency", "[scalability][!hide]")
     txtime.Clear();
 
     // Generate payment txs
-    loadGen.generateLoad(LoadGenMode::PAY, numItems, 0, numItems / 10, 10, 100,
-                         std::chrono::seconds(0), 0);
+    loadGen.generateLoad(GeneratedLoadConfig::txLoad(LoadGenMode::PAY, numItems,
+                                                     numItems / 10, 10));
     while (!io.stopped() && complete.count() == 1)
     {
         clock.crank();
@@ -574,8 +569,9 @@ netTopologyTest(std::string const& name,
         auto& app = *nodes[0];
 
         auto& loadGen = app.getLoadGenerator();
-        loadGen.generateLoad(LoadGenMode::CREATE, 50, 0, 0, 10, 100,
-                             std::chrono::seconds(0), 0);
+        loadGen.generateLoad(GeneratedLoadConfig::createAccountsLoad(
+            /* nAccounts */ 50,
+            /* txRate */ 10));
         auto& complete =
             app.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
 
@@ -679,11 +675,14 @@ TEST_CASE("Bucket list entries vs write throughput", "[scalability][!hide]")
          !app->getClock().getIOContext().stopped() && i < 0x200000; ++i)
     {
         app->getClock().crank(false);
-        app->getBucketManager().addBatch(
-            *app, i, Config::CURRENT_LEDGER_PROTOCOL_VERSION,
-            LedgerTestUtils::generateValidLedgerEntries(100),
+        LedgerHeader lh;
+        lh.ledgerVersion = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+        lh.ledgerSeq = i;
+        BucketTestUtils::addLiveBatchAndUpdateSnapshot(
+            *app, lh, LedgerTestUtils::generateValidLedgerEntries(100),
             LedgerTestUtils::generateValidLedgerEntries(20),
-            LedgerTestUtils::generateLedgerKeys(5));
+            LedgerTestUtils::generateValidLedgerEntryKeysWithExclusions(
+                {CONFIG_SETTING}, 5));
 
         if ((i & 0xff) == 0xff)
         {
@@ -692,7 +691,8 @@ TEST_CASE("Bucket list entries vs write throughput", "[scalability][!hide]")
                      batch.GetSnapshot().get99thPercentile(), batch.max(),
                      (double)merges.count(), merges.max(), merges.mean()});
 
-            app->getBucketManager().forgetUnreferencedBuckets();
+            app->getBucketManager().forgetUnreferencedBuckets(
+                app->getLedgerManager().getLastClosedLedgerHAS());
         }
     }
 }

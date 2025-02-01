@@ -15,13 +15,12 @@ using namespace stellar;
 TEST_CASE("cannot close ledger with unsupported ledger version", "[ledger]")
 {
     VirtualClock clock;
-    Application::pointer app = Application::create(clock, getTestConfig(0));
+    Application::pointer app = Application::create(clock, getTestConfig());
     app->start();
 
     auto applyEmptyLedger = [&]() {
         auto const& lcl = app->getLedgerManager().getLastClosedLedgerHeader();
-        auto txSet = std::make_shared<TxSetFrame const>(lcl.hash);
-
+        auto txSet = TxSetXDRFrame::makeEmpty(lcl);
         StellarValue sv = app->getHerder().makeStellarValue(
             txSet->getContentsHash(), 1, emptyUpgradeSteps,
             app->getConfig().NODE_SEED);

@@ -6,36 +6,16 @@
 
 #include "database/Database.h"
 #include "overlay/StellarXDR.h"
-#include "transactions/TransactionFrameBase.h"
 
 namespace stellar
 {
-class XDROutputFileStream;
+class Application;
+class CheckpointBuilder;
 
-void storeTransaction(Database& db, uint32_t ledgerSeq,
-                      TransactionFrameBasePtr const& tx, TransactionMeta& tm,
-                      TransactionResultSet const& resultSet);
-
-void storeTransactionFee(Database& db, uint32_t ledgerSeq,
-                         TransactionFrameBasePtr const& tx,
-                         LedgerEntryChanges const& changes, uint32_t txIndex);
-
-TransactionResultSet getTransactionHistoryResults(Database& db,
-                                                  uint32 ledgerSeq);
-
-std::vector<LedgerEntryChanges> getTransactionFeeMeta(Database& db,
-                                                      uint32 ledgerSeq);
-
-size_t copyTransactionsToStream(Hash const& networkID, Database& db,
-                                soci::session& sess, uint32_t ledgerSeq,
-                                uint32_t ledgerCount,
-                                XDROutputFileStream& txOut,
-                                XDROutputFileStream& txResultOut);
-
-void dropTransactionHistory(Database& db);
-
-void deleteOldTransactionHistoryEntries(Database& db, uint32_t ledgerSeq,
-                                        uint32_t count);
-
-void deleteNewerTransactionHistoryEntries(Database& db, uint32_t ledgerSeq);
+size_t populateCheckpointFilesFromDB(Application& app, soci::session& sess,
+                                     uint32_t ledgerSeq, uint32_t ledgerCount,
+                                     CheckpointBuilder& checkpointBuilder);
+void dropSupportTransactionFeeHistory(Database& db);
+void dropSupportTxSetHistory(Database& db);
+void dropSupportTxHistory(Database& db);
 }

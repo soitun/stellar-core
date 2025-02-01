@@ -1,9 +1,7 @@
 #include "overlay/OverlayMetrics.h"
 #include "main/Application.h"
 
-#include "medida/meter.h"
 #include "medida/metrics_registry.h"
-#include "medida/timer.h"
 
 namespace stellar
 {
@@ -32,6 +30,10 @@ OverlayMetrics::OverlayMetrics(Application& app)
           {"overlay", "timeout", "straggler"}, "timeout"))
     , mConnectionLatencyTimer(
           app.getMetrics().NewTimer({"overlay", "connection", "latency"}))
+    , mConnectionReadThrottle(
+          app.getMetrics().NewTimer({"overlay", "connection", "read-throttle"}))
+    , mConnectionFloodThrottle(app.getMetrics().NewTimer(
+          {"overlay", "connection", "flood-throttle"}))
 
     , mItemFetcherNextPeer(app.getMetrics().NewMeter(
           {"overlay", "item-fetcher", "next-peer"}, "item-fetcher"))
@@ -41,8 +43,6 @@ OverlayMetrics::OverlayMetrics(Application& app)
     , mRecvAuthTimer(app.getMetrics().NewTimer({"overlay", "recv", "auth"}))
     , mRecvDontHaveTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "dont-have"}))
-    , mRecvGetPeersTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "get-peers"}))
     , mRecvPeersTimer(app.getMetrics().NewTimer({"overlay", "recv", "peers"}))
     , mRecvGetTxSetTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "get-txset"}))
@@ -73,6 +73,16 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewTimer({"overlay", "recv", "survey-request"}))
     , mRecvSurveyResponseTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "survey-response"}))
+    , mRecvStartSurveyCollectingTimer(app.getMetrics().NewTimer(
+          {"overlay", "recv", "start-survey-collecting"}))
+    , mRecvStopSurveyCollectingTimer(app.getMetrics().NewTimer(
+          {"overlay", "recv", "stop-survey-collecting"}))
+
+    , mRecvFloodAdvertTimer(
+          app.getMetrics().NewTimer({"overlay", "recv", "flood-advert"}))
+    , mRecvFloodDemandTimer(
+          app.getMetrics().NewTimer({"overlay", "recv", "flood-demand"}))
+
     , mMessageDelayInWriteQueueTimer(
           app.getMetrics().NewTimer({"overlay", "delay", "write-queue"}))
     , mMessageDelayInAsyncWriteTimer(
@@ -81,7 +91,19 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewTimer({"overlay", "outbound-queue", "scp"}))
     , mOutboundQueueDelayTxs(
           app.getMetrics().NewTimer({"overlay", "outbound-queue", "tx"}))
+    , mOutboundQueueDelayAdvert(
+          app.getMetrics().NewTimer({"overlay", "outbound-queue", "advert"}))
+    , mOutboundQueueDelayDemand(
+          app.getMetrics().NewTimer({"overlay", "outbound-queue", "demand"}))
 
+    , mOutboundQueueDropSCP(app.getMetrics().NewMeter(
+          {"overlay", "outbound-queue", "drop-scp"}, "message"))
+    , mOutboundQueueDropTxs(app.getMetrics().NewMeter(
+          {"overlay", "outbound-queue", "drop-tx"}, "message"))
+    , mOutboundQueueDropAdvert(app.getMetrics().NewMeter(
+          {"overlay", "outbound-queue", "drop-advert"}, "message"))
+    , mOutboundQueueDropDemand(app.getMetrics().NewMeter(
+          {"overlay", "outbound-queue", "drop-demand"}, "message"))
     , mSendErrorMeter(
           app.getMetrics().NewMeter({"overlay", "send", "error"}, "message"))
     , mSendHelloMeter(
@@ -90,8 +112,6 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewMeter({"overlay", "send", "auth"}, "message"))
     , mSendDontHaveMeter(app.getMetrics().NewMeter(
           {"overlay", "send", "dont-have"}, "message"))
-    , mSendGetPeersMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "get-peers"}, "message"))
     , mSendPeersMeter(
           app.getMetrics().NewMeter({"overlay", "send", "peers"}, "message"))
     , mSendGetTxSetMeter(app.getMetrics().NewMeter(
@@ -114,14 +134,42 @@ OverlayMetrics::OverlayMetrics(Application& app)
           {"overlay", "send", "survey-request"}, "message"))
     , mSendSurveyResponseMeter(app.getMetrics().NewMeter(
           {"overlay", "send", "survey-response"}, "message"))
+    , mSendStartSurveyCollectingMeter(app.getMetrics().NewMeter(
+          {"overlay", "send", "start-survey-collecting"}, "message"))
+    , mSendStopSurveyCollectingMeter(app.getMetrics().NewMeter(
+          {"overlay", "send", "stop-survey-collecting"}, "message"))
+    , mSendFloodAdvertMeter(app.getMetrics().NewMeter(
+          {"overlay", "send", "flood-advert"}, "message"))
+    , mSendFloodDemandMeter(app.getMetrics().NewMeter(
+          {"overlay", "send", "flood-demand"}, "message"))
+    , mMessagesDemanded(app.getMetrics().NewMeter(
+          {"overlay", "flood", "demanded"}, "message"))
+    , mMessagesFulfilledMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "fulfilled"}, "message"))
+    , mBannedMessageUnfulfilledMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "unfulfilled-banned"}, "message"))
+    , mUnknownMessageUnfulfilledMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "unfulfilled-unknown"}, "message"))
+    , mTxPullLatency(
+          app.getMetrics().NewTimer({"overlay", "flood", "tx-pull-latency"}))
+    , mPeerTxPullLatency(app.getMetrics().NewTimer(
+          {"overlay", "flood", "peer-tx-pull-latency"}))
+    , mAdvertQueueDelay(
+          app.getMetrics().NewTimer({"overlay", "flood", "advert-delay"}))
+    , mDemandTimeouts(app.getMetrics().NewMeter(
+          {"overlay", "demand", "timeout"}, "timeout"))
+    , mPulledRelevantTxs(app.getMetrics().NewMeter(
+          {"overlay", "flood", "relevant-txs"}, "transaction"))
+    , mPulledIrrelevantTxs(app.getMetrics().NewMeter(
+          {"overlay", "flood", "irrelevant-txs"}, "transaction"))
+    , mAbandonedDemandMeter(app.getMetrics().NewMeter(
+          {"overlay", "flood", "abandoned-demands"}, "message"))
     , mMessagesBroadcast(app.getMetrics().NewMeter(
           {"overlay", "message", "broadcast"}, "message"))
     , mPendingPeersSize(
           app.getMetrics().NewCounter({"overlay", "connection", "pending"}))
     , mAuthenticatedPeersSize(app.getMetrics().NewCounter(
           {"overlay", "connection", "authenticated"}))
-    , mFlowControlPercent(app.getMetrics().NewCounter(
-          {"overlay", "flow-control", "percentage"}))
     , mUniqueFloodBytesRecv(app.getMetrics().NewMeter(
           {"overlay", "flood", "unique-recv"}, "byte"))
     , mDuplicateFloodBytesRecv(app.getMetrics().NewMeter(

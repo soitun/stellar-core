@@ -172,11 +172,18 @@ class SCPDriver
     virtual void setupTimer(uint64 slotIndex, int timerID,
                             std::chrono::milliseconds timeout,
                             std::function<void()> cb) = 0;
+    virtual void stopTimer(uint64 slotIndex, int timerID) = 0;
 
     // `computeTimeout` computes a timeout given a round number
     // it should be sufficiently large such that nodes in a
     // quorum can exchange 4 messages
     virtual std::chrono::milliseconds computeTimeout(uint32 roundNumber);
+
+    // returns the weight of the node within the qset normalized between
+    // 0-UINT64_MAX. If `nodeID` is the local node, then set `isLocalNode` to
+    // `true`.
+    virtual uint64 getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
+                                 bool isLocalNode) const;
 
     // Inform about events happening within the consensus algorithm.
 
@@ -237,6 +244,15 @@ class SCPDriver
     ballotDidHearFromQuorum(uint64 slotIndex, SCPBallot const& ballot)
     {
     }
+
+#ifdef BUILD_TESTS
+    std::function<uint64(NodeID const&)> mPriorityLookupForTesting;
+    void
+    setPriorityLookup(std::function<uint64(NodeID const&)> const& f)
+    {
+        mPriorityLookupForTesting = f;
+    }
+#endif
 
   private:
     uint64

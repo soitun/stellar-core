@@ -3,16 +3,21 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/Upgrades.h"
+#include "bucket/BucketManager.h"
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "database/Database.h"
 #include "database/DatabaseUtils.h"
+#include "herder/Herder.h"
 #include "ledger/LedgerHeaderUtils.h"
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnHeader.h"
+#include "ledger/LedgerTypeUtils.h"
+#include "ledger/NetworkConfig.h"
 #include "ledger/TrustLineWrapper.h"
 #include "main/Config.h"
+#include "rust/RustBridge.h"
 #include "transactions/OfferExchange.h"
 #include "transactions/SponsorshipUtils.h"
 #include "transactions/TransactionUtils.h"
@@ -20,7 +25,9 @@
 #include "util/Logging.h"
 #include "util/ProtocolVersion.h"
 #include "util/Timer.h"
+#include "util/XDRCereal.h"
 #include "util/types.h"
+#include "xdrpp/printer.h"
 #include <Tracy.hpp>
 #include <cereal/archives/json.hpp>
 #include <cereal/cereal.hpp>
@@ -45,6 +52,15 @@ save(Archive& ar, stellar::Upgrades::UpgradeParameters const& p)
     ar(make_nvp("maxtxsize", p.mMaxTxSetSize));
     ar(make_nvp("reserve", p.mBaseReserve));
     ar(make_nvp("flags", p.mFlags));
+
+    std::optional<std::string> configUpgradeKeyStr;
+    if (p.mConfigUpgradeSetKey)
+    {
+        configUpgradeKeyStr = stellar::decoder::encode_b64(
+            xdr::xdr_to_opaque(*p.mConfigUpgradeSetKey));
+    }
+    ar(make_nvp("configupgradesetkey", configUpgradeKeyStr));
+    ar(make_nvp("maxsorobantxsetsize", p.mMaxSorobanTxSetSize));
 }
 
 template <class Archive>
@@ -59,22 +75,69 @@ load(Archive& ar, stellar::Upgrades::UpgradeParameters& o)
     ar(make_nvp("maxtxsize", o.mMaxTxSetSize));
     ar(make_nvp("reserve", o.mBaseReserve));
 
-    // the flags upgrade was added after the fields above, so it's possible for
-    // them not to exist in the database
+    // the flags and configupgrade upgrades were added after the fields above,
+    // so it's possible for them not to exist in the database
     try
     {
         ar(make_nvp("flags", o.mFlags));
+        ar(make_nvp("maxsorobantxsetsize", o.mMaxSorobanTxSetSize));
+
+        std::optional<std::string> configUpgradeKeyStr;
+        ar(make_nvp("configupgradesetkey", configUpgradeKeyStr));
+
+        if (configUpgradeKeyStr)
+        {
+            std::vector<uint8_t> buffer;
+            stellar::decoder::decode_b64(configUpgradeKeyStr.value(), buffer);
+            stellar::ConfigUpgradeSetKey key;
+            xdr::xdr_from_opaque(buffer, key);
+
+            o.mConfigUpgradeSetKey = key;
+        }
+        else
+        {
+            o.mConfigUpgradeSetKey.reset();
+        }
     }
     catch (cereal::Exception&)
     {
-        // flags name not found
+        // flags or configupgrade name not found
+    }
+    catch (std::exception&)
+    {
+        // Invalid base64 or xdr for configupgrade
     }
 }
 } // namespace cereal
 
 namespace stellar
 {
+namespace
+{
+uint32_t
+readMaxSorobanTxSetSize(LedgerSnapshot const& ls)
+{
+    LedgerKey key(LedgerEntryType::CONFIG_SETTING);
+    key.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_EXECUTION_LANES;
+    return ls.load(key)
+        .current()
+        .data.configSetting()
+        .contractExecutionLanes()
+        .ledgerMaxTxCount;
+}
 
+void
+upgradeMaxSorobanTxSetSize(AbstractLedgerTxn& ltx, uint32_t maxTxSetSize)
+{
+    LedgerKey key(LedgerEntryType::CONFIG_SETTING);
+    key.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_EXECUTION_LANES;
+    auto& le = ltx.load(key).current();
+    le.data.configSetting().contractExecutionLanes().ledgerMaxTxCount =
+        maxTxSetSize;
+}
+} // namespace
 std::chrono::hours const Upgrades::UPDGRADE_EXPIRATION_HOURS(12);
 
 std::string
@@ -86,6 +149,37 @@ Upgrades::UpgradeParameters::toJson() const
         cereal::save(ar, *this);
     }
     return out.str();
+}
+
+std::string
+Upgrades::UpgradeParameters::toDebugJson(LedgerSnapshot const& ls) const
+{
+    Json::Value upgradesJson;
+    Json::Reader reader;
+    reader.parse(toJson(), upgradesJson);
+
+    if (mConfigUpgradeSetKey)
+    {
+        // combine the key and actual config upgrade set under a single Json
+        // value
+        upgradesJson["configupgradeinfo"]["configupgradesetkey"] =
+            upgradesJson["configupgradesetkey"];
+        upgradesJson.removeMember("configupgradesetkey");
+
+        auto upgradeSetPtr =
+            ConfigUpgradeSetFrame::makeFromKey(ls, *mConfigUpgradeSetKey);
+        if (upgradeSetPtr)
+        {
+            Json::Value configUpgradeSetJson;
+            Json::Reader reader2;
+            reader2.parse(upgradeSetPtr->toJson(), configUpgradeSetJson);
+            upgradesJson["configupgradeinfo"]["configupgradeset"] =
+                configUpgradeSetJson;
+        }
+    }
+
+    Json::StyledWriter writer;
+    return writer.write(upgradesJson);
 }
 
 static std::string
@@ -163,55 +257,80 @@ Upgrades::getParameters() const
 }
 
 std::vector<LedgerUpgrade>
-Upgrades::createUpgradesFor(LedgerHeader const& header) const
+Upgrades::createUpgradesFor(LedgerHeader const& lclHeader,
+                            LedgerSnapshot const& ls) const
 {
     auto result = std::vector<LedgerUpgrade>{};
-    if (!timeForUpgrade(header.scpValue.closeTime))
+    if (!timeForUpgrade(lclHeader.scpValue.closeTime))
     {
         return result;
     }
 
     if (mParams.mProtocolVersion &&
-        (header.ledgerVersion != *mParams.mProtocolVersion))
+        (lclHeader.ledgerVersion != *mParams.mProtocolVersion))
     {
         result.emplace_back(LEDGER_UPGRADE_VERSION);
         result.back().newLedgerVersion() = *mParams.mProtocolVersion;
     }
-    if (mParams.mBaseFee && (header.baseFee != *mParams.mBaseFee))
+    if (mParams.mBaseFee && (lclHeader.baseFee != *mParams.mBaseFee))
     {
         result.emplace_back(LEDGER_UPGRADE_BASE_FEE);
         result.back().newBaseFee() = *mParams.mBaseFee;
     }
     if (mParams.mMaxTxSetSize &&
-        (header.maxTxSetSize != *mParams.mMaxTxSetSize))
+        (lclHeader.maxTxSetSize != *mParams.mMaxTxSetSize))
     {
         result.emplace_back(LEDGER_UPGRADE_MAX_TX_SET_SIZE);
         result.back().newMaxTxSetSize() = *mParams.mMaxTxSetSize;
     }
-    if (mParams.mBaseReserve && (header.baseReserve != *mParams.mBaseReserve))
+    if (mParams.mBaseReserve &&
+        (lclHeader.baseReserve != *mParams.mBaseReserve))
     {
         result.emplace_back(LEDGER_UPGRADE_BASE_RESERVE);
         result.back().newBaseReserve() = *mParams.mBaseReserve;
     }
     if (mParams.mFlags)
     {
-        if (LedgerHeaderUtils::getFlags(header) != *mParams.mFlags)
+        if (LedgerHeaderUtils::getFlags(lclHeader) != *mParams.mFlags)
         {
             result.emplace_back(LEDGER_UPGRADE_FLAGS);
             result.back().newFlags() = *mParams.mFlags;
         }
     }
-
+    if (mParams.mMaxSorobanTxSetSize)
+    {
+        if (protocolVersionStartsFrom(lclHeader.ledgerVersion,
+                                      SOROBAN_PROTOCOL_VERSION) &&
+            readMaxSorobanTxSetSize(ls) != *mParams.mMaxSorobanTxSetSize)
+        {
+            result.emplace_back(LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE);
+            result.back().newMaxSorobanTxSetSize() =
+                *mParams.mMaxSorobanTxSetSize;
+        }
+    }
+    auto key = mParams.mConfigUpgradeSetKey;
+    if (key)
+    {
+        auto cfgUpgrade = ConfigUpgradeSetFrame::makeFromKey(ls, *key);
+        if (cfgUpgrade != nullptr &&
+            cfgUpgrade->isValidForApply() == UpgradeValidity::VALID &&
+            cfgUpgrade->upgradeNeeded(ls))
+        {
+            result.emplace_back(LEDGER_UPGRADE_CONFIG);
+            result.back().newConfig() = cfgUpgrade->getKey();
+        }
+    }
     return result;
 }
 
 void
-Upgrades::applyTo(LedgerUpgrade const& upgrade, AbstractLedgerTxn& ltx)
+Upgrades::applyTo(LedgerUpgrade const& upgrade, Application& app,
+                  AbstractLedgerTxn& ltx)
 {
     switch (upgrade.type())
     {
     case LEDGER_UPGRADE_VERSION:
-        applyVersionUpgrade(ltx, upgrade.newLedgerVersion());
+        applyVersionUpgrade(app, ltx, upgrade.newLedgerVersion());
         break;
     case LEDGER_UPGRADE_BASE_FEE:
         ltx.loadHeader().current().baseFee = upgrade.newBaseFee();
@@ -224,6 +343,27 @@ Upgrades::applyTo(LedgerUpgrade const& upgrade, AbstractLedgerTxn& ltx)
         break;
     case LEDGER_UPGRADE_FLAGS:
         setLedgerHeaderFlag(ltx.loadHeader().current(), upgrade.newFlags());
+        break;
+    case LEDGER_UPGRADE_CONFIG:
+    {
+        LedgerSnapshot ltxState(ltx);
+        auto cfgUpgrade =
+            ConfigUpgradeSetFrame::makeFromKey(ltxState, upgrade.newConfig());
+        if (!cfgUpgrade)
+        {
+            throw std::runtime_error(
+                "Failed to retrieve valid config upgrade set");
+        }
+        if (cfgUpgrade->isValidForApply() != Upgrades::UpgradeValidity::VALID)
+        {
+            throw std::runtime_error("config upgrade set is no longer valid");
+        }
+        CLOG_INFO(Ledger, "Applying config upgrade: {}", cfgUpgrade->toJson());
+        cfgUpgrade->applyTo(ltx);
+        break;
+    }
+    case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
+        upgradeMaxSorobanTxSetSize(ltx, upgrade.newMaxSorobanTxSetSize());
         break;
     default:
     {
@@ -252,6 +392,13 @@ Upgrades::toString(LedgerUpgrade const& upgrade)
                            upgrade.newBaseReserve());
     case LEDGER_UPGRADE_FLAGS:
         return fmt::format(FMT_STRING("flags={:d}"), upgrade.newFlags());
+    case LEDGER_UPGRADE_CONFIG:
+        return fmt::format(
+            FMT_STRING("{}"),
+            xdrToCerealString(upgrade.newConfig(), "configupgradesetkey"));
+    case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
+        return fmt::format(FMT_STRING("maxsorobantxsetsize={:d}"),
+                           upgrade.newMaxSorobanTxSetSize());
     default:
         return "<unsupported>";
     }
@@ -263,17 +410,21 @@ Upgrades::toString() const
     std::stringstream r;
     bool first = true;
 
+    auto maybePrintUpgradeTime = [&]() {
+        if (first)
+        {
+            r << fmt::format(
+                FMT_STRING("upgradetime={}"),
+                VirtualClock::systemPointToISOString(mParams.mUpgradeTime));
+            first = false;
+        }
+    };
+
     auto appendInfo = [&](std::string const& s,
                           std::optional<uint32> const& o) {
         if (o)
         {
-            if (first)
-            {
-                r << fmt::format(
-                    FMT_STRING("upgradetime={}"),
-                    VirtualClock::systemPointToISOString(mParams.mUpgradeTime));
-                first = false;
-            }
+            maybePrintUpgradeTime();
             r << fmt::format(FMT_STRING(", {}={:d}"), s, *o);
         }
     };
@@ -281,8 +432,15 @@ Upgrades::toString() const
     appendInfo("basefee", mParams.mBaseFee);
     appendInfo("basereserve", mParams.mBaseReserve);
     appendInfo("maxtxsetsize", mParams.mMaxTxSetSize);
+    appendInfo("maxsorobantxsetsize", mParams.mMaxSorobanTxSetSize);
     appendInfo("flags", mParams.mFlags);
-
+    if (mParams.mConfigUpgradeSetKey)
+    {
+        maybePrintUpgradeTime();
+        r << fmt::format(FMT_STRING(", {}"),
+                         xdrToCerealString(*mParams.mConfigUpgradeSetKey,
+                                           "configupgradesetkey"));
+    }
     return r.str();
 }
 
@@ -311,8 +469,14 @@ Upgrades::removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
         resetParamIfSet(res.mProtocolVersion);
         resetParamIfSet(res.mBaseFee);
         resetParamIfSet(res.mMaxTxSetSize);
+        resetParamIfSet(res.mMaxSorobanTxSetSize);
         resetParamIfSet(res.mBaseReserve);
         resetParamIfSet(res.mFlags);
+        if (res.mConfigUpgradeSetKey)
+        {
+            res.mConfigUpgradeSetKey.reset();
+            updated = true;
+        }
 
         return res;
     }
@@ -354,6 +518,19 @@ Upgrades::removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
         case LEDGER_UPGRADE_FLAGS:
             resetParam(res.mFlags, lu.newFlags());
             break;
+        case LEDGER_UPGRADE_CONFIG:
+        {
+            if (res.mConfigUpgradeSetKey &&
+                *res.mConfigUpgradeSetKey == lu.newConfig())
+            {
+                res.mConfigUpgradeSetKey.reset();
+                updated = true;
+            }
+            break;
+        }
+        case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
+            resetParam(res.mMaxSorobanTxSetSize, lu.newMaxSorobanTxSetSize());
+            break;
         default:
             // skip unknown
             break;
@@ -364,8 +541,8 @@ Upgrades::removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
 
 Upgrades::UpgradeValidity
 Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
-                          LedgerUpgrade& upgrade, LedgerHeader const& header,
-                          uint32_t maxLedgerVersion)
+                          LedgerUpgrade& upgrade, Application& app,
+                          LedgerSnapshot const& ls)
 {
     try
     {
@@ -377,15 +554,16 @@ Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
     }
 
     bool res = true;
+    auto version = ls.getLedgerHeader().current().ledgerVersion;
     switch (upgrade.type())
     {
     case LEDGER_UPGRADE_VERSION:
     {
         uint32 newVersion = upgrade.newLedgerVersion();
         // only allow upgrades to a supported version of the protocol
-        res = res && (newVersion <= maxLedgerVersion);
+        res = res && (newVersion <= app.getConfig().LEDGER_PROTOCOL_VERSION);
         // and enforce versions to be strictly monotonic
-        res = res && (newVersion > header.ledgerVersion);
+        res = res && (newVersion > version);
     }
     break;
     case LEDGER_UPGRADE_BASE_FEE:
@@ -399,9 +577,35 @@ Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
         break;
     case LEDGER_UPGRADE_FLAGS:
         res = res &&
-              protocolVersionStartsFrom(header.ledgerVersion,
-                                        ProtocolVersion::V_18) &&
+              protocolVersionStartsFrom(version, ProtocolVersion::V_18) &&
               (upgrade.newFlags() & ~MASK_LEDGER_HEADER_FLAGS) == 0;
+        break;
+    case LEDGER_UPGRADE_CONFIG:
+    {
+        if (protocolVersionIsBefore(version, SOROBAN_PROTOCOL_VERSION))
+        {
+            return UpgradeValidity::INVALID;
+        }
+        auto cfgUpgrade =
+            ConfigUpgradeSetFrame::makeFromKey(ls, upgrade.newConfig());
+        if (!cfgUpgrade)
+        {
+            return UpgradeValidity::INVALID;
+        }
+        auto configUpgradeValid = cfgUpgrade->isValidForApply();
+        if (configUpgradeValid == UpgradeValidity::XDR_INVALID)
+        {
+            return UpgradeValidity::XDR_INVALID;
+        }
+        res = res && (configUpgradeValid == UpgradeValidity::VALID);
+        break;
+    }
+    case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
+        if (protocolVersionIsBefore(version, SOROBAN_PROTOCOL_VERSION))
+        {
+            return UpgradeValidity::INVALID;
+        }
+        // Any size is valid.
         break;
     default:
         res = false;
@@ -412,9 +616,9 @@ Upgrades::isValidForApply(UpgradeType const& opaqueUpgrade,
 
 bool
 Upgrades::isValidForNomination(LedgerUpgrade const& upgrade,
-                               LedgerHeader const& header) const
+                               LedgerSnapshot const& ls) const
 {
-    if (!timeForUpgrade(header.scpValue.closeTime))
+    if (!timeForUpgrade(ls.getLedgerHeader().current().scpValue.closeTime))
     {
         return false;
     }
@@ -434,6 +638,23 @@ Upgrades::isValidForNomination(LedgerUpgrade const& upgrade,
                (upgrade.newBaseReserve() == *mParams.mBaseReserve);
     case LEDGER_UPGRADE_FLAGS:
         return mParams.mFlags && (upgrade.newFlags() == *mParams.mFlags);
+    case LEDGER_UPGRADE_CONFIG:
+    {
+        if (!mParams.mConfigUpgradeSetKey)
+        {
+            return false;
+        }
+
+        auto cfgUpgrade =
+            ConfigUpgradeSetFrame::makeFromKey(ls, upgrade.newConfig());
+        return cfgUpgrade &&
+               cfgUpgrade->isConsistentWith(ConfigUpgradeSetFrame::makeFromKey(
+                   ls, *mParams.mConfigUpgradeSetKey));
+    }
+    case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
+        return mParams.mMaxSorobanTxSetSize &&
+               (upgrade.newMaxSorobanTxSetSize() ==
+                *mParams.mMaxSorobanTxSetSize);
     default:
         return false;
     }
@@ -441,17 +662,16 @@ Upgrades::isValidForNomination(LedgerUpgrade const& upgrade,
 
 bool
 Upgrades::isValid(UpgradeType const& upgrade, LedgerUpgradeType& upgradeType,
-                  bool nomination, Config const& cfg,
-                  LedgerHeader const& header) const
+                  bool nomination, Application& app) const
 {
     LedgerUpgrade lupgrade;
+    auto ls = LedgerSnapshot(app);
     bool res =
-        isValidForApply(upgrade, lupgrade, header,
-                        cfg.LEDGER_PROTOCOL_VERSION) == UpgradeValidity::VALID;
+        isValidForApply(upgrade, lupgrade, app, ls) == UpgradeValidity::VALID;
 
     if (nomination)
     {
-        res = res && isValidForNomination(lupgrade, header);
+        res = res && isValidForNomination(lupgrade, ls);
     }
 
     if (res)
@@ -470,66 +690,22 @@ Upgrades::timeForUpgrade(uint64_t time) const
 void
 Upgrades::dropAll(Database& db)
 {
-    db.getSession() << "DROP TABLE IF EXISTS upgradehistory";
-    db.getSession() << "CREATE TABLE upgradehistory ("
-                       "ledgerseq    INT NOT NULL CHECK (ledgerseq >= 0), "
-                       "upgradeindex INT NOT NULL, "
-                       "upgrade      TEXT NOT NULL, "
-                       "changes      TEXT NOT NULL, "
-                       "PRIMARY KEY (ledgerseq, upgradeindex)"
-                       ")";
-    db.getSession()
+    db.getRawSession() << "DROP TABLE IF EXISTS upgradehistory";
+    db.getRawSession() << "CREATE TABLE upgradehistory ("
+                          "ledgerseq    INT NOT NULL CHECK (ledgerseq >= 0), "
+                          "upgradeindex INT NOT NULL, "
+                          "upgrade      TEXT NOT NULL, "
+                          "changes      TEXT NOT NULL, "
+                          "PRIMARY KEY (ledgerseq, upgradeindex)"
+                          ")";
+    db.getRawSession()
         << "CREATE INDEX upgradehistbyseq ON upgradehistory (ledgerseq);";
 }
 
 void
-Upgrades::storeUpgradeHistory(Database& db, uint32_t ledgerSeq,
-                              LedgerUpgrade const& upgrade,
-                              LedgerEntryChanges const& changes, int index)
+Upgrades::dropSupportUpgradeHistory(Database& db)
 {
-    ZoneScoped;
-    xdr::opaque_vec<> upgradeContent(xdr::xdr_to_opaque(upgrade));
-    std::string upgradeContent64 = decoder::encode_b64(upgradeContent);
-
-    xdr::opaque_vec<> upgradeChanges(xdr::xdr_to_opaque(changes));
-    std::string upgradeChanges64 = decoder::encode_b64(upgradeChanges);
-
-    auto prep = db.getPreparedStatement(
-        "INSERT INTO upgradehistory "
-        "(ledgerseq, upgradeindex,  upgrade,  changes) VALUES "
-        "(:seq,      :upgradeindex, :upgrade, :changes)");
-
-    auto& st = prep.statement();
-    st.exchange(soci::use(ledgerSeq));
-    st.exchange(soci::use(index));
-    st.exchange(soci::use(upgradeContent64));
-    st.exchange(soci::use(upgradeChanges64));
-    st.define_and_bind();
-    {
-        ZoneNamedN(insertUpgradeZone, "insert upgradehistory", true);
-        st.execute(true);
-    }
-
-    if (st.get_affected_rows() != 1)
-    {
-        throw std::runtime_error("Could not update data in SQL");
-    }
-}
-
-void
-Upgrades::deleteOldEntries(Database& db, uint32_t ledgerSeq, uint32_t count)
-{
-    ZoneScoped;
-    DatabaseUtils::deleteOldEntriesHelper(db.getSession(), ledgerSeq, count,
-                                          "upgradehistory", "ledgerseq");
-}
-
-void
-Upgrades::deleteNewerEntries(Database& db, uint32_t ledgerSeq)
-{
-    ZoneScoped;
-    DatabaseUtils::deleteNewerEntriesHelper(db.getSession(), ledgerSeq,
-                                            "upgradehistory", "ledgerseq");
+    db.getRawSession() << "DROP TABLE IF EXISTS upgradehistory";
 }
 
 static void
@@ -994,24 +1170,59 @@ upgradeFromProtocol15To16(AbstractLedgerTxn& ltx)
     }
 }
 
+static bool
+needUpgradeToVersion(ProtocolVersion targetVersion, uint32_t prevVersion,
+                     uint32_t newVersion)
+{
+    return protocolVersionIsBefore(prevVersion, targetVersion) &&
+           protocolVersionStartsFrom(newVersion, targetVersion);
+}
+
 void
-Upgrades::applyVersionUpgrade(AbstractLedgerTxn& ltx, uint32_t newVersion)
+Upgrades::applyVersionUpgrade(Application& app, AbstractLedgerTxn& ltx,
+                              uint32_t newVersion)
 {
     auto header = ltx.loadHeader();
     uint32_t prevVersion = header.current().ledgerVersion;
 
     header.current().ledgerVersion = newVersion;
-    if (protocolVersionStartsFrom(header.current().ledgerVersion,
-                                  ProtocolVersion::V_10) &&
-        protocolVersionIsBefore(prevVersion, ProtocolVersion::V_10))
+    if (needUpgradeToVersion(ProtocolVersion::V_10, prevVersion, newVersion))
     {
         prepareLiabilities(ltx, header);
     }
-    else if (protocolVersionEquals(header.current().ledgerVersion,
-                                   ProtocolVersion::V_16) &&
-             protocolVersionEquals(prevVersion, ProtocolVersion::V_15))
+    if (protocolVersionEquals(header.current().ledgerVersion,
+                              ProtocolVersion::V_16) &&
+        protocolVersionEquals(prevVersion, ProtocolVersion::V_15))
     {
         upgradeFromProtocol15To16(ltx);
+    }
+    if (needUpgradeToVersion(SOROBAN_PROTOCOL_VERSION, prevVersion, newVersion))
+    {
+        SorobanNetworkConfig::createLedgerEntriesForV20(ltx, app);
+#ifdef BUILD_TESTS
+        // Update the costs in case if we're in loadgen mode, so that the costs
+        // reflect the most recent calibration on p20. This would break
+        // if we tried to replay the ledger, but we shouldn't be combining load
+        // generation with the ledger replay.
+        if (app.getConfig().ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING &&
+            app.getConfig()
+                .UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING)
+        {
+            SorobanNetworkConfig::updateRecalibratedCostTypesForV20(ltx);
+        }
+#endif
+    }
+    if (needUpgradeToVersion(ProtocolVersion::V_21, prevVersion, newVersion))
+    {
+        SorobanNetworkConfig::createCostTypesForV21(ltx, app);
+    }
+    if (needUpgradeToVersion(ProtocolVersion::V_22, prevVersion, newVersion))
+    {
+        SorobanNetworkConfig::createCostTypesForV22(ltx, app);
+    }
+    if (needUpgradeToVersion(ProtocolVersion::V_23, prevVersion, newVersion))
+    {
+        SorobanNetworkConfig::createLedgerEntriesForV23(ltx, app);
     }
 }
 
@@ -1028,5 +1239,209 @@ Upgrades::applyReserveUpgrade(AbstractLedgerTxn& ltx, uint32_t newReserve)
     {
         prepareLiabilities(ltx, header);
     }
+}
+
+ConfigUpgradeSetFrameConstPtr
+ConfigUpgradeSetFrame::makeFromKey(LedgerSnapshot const& ls,
+                                   ConfigUpgradeSetKey const& key)
+{
+    auto lk = ConfigUpgradeSetFrame::getLedgerKey(key);
+    auto ltxe = ls.load(lk);
+    if (!ltxe)
+    {
+        return nullptr;
+    }
+
+    auto ttlLtxe = ls.load(getTTLKey(lk));
+    releaseAssert(ttlLtxe);
+    if (!isLive(ttlLtxe.current(), ls.getLedgerHeader().current().ledgerSeq))
+    {
+        return nullptr;
+    }
+
+    auto const& contractData = ltxe.current().data.contractData();
+    if (contractData.val.type() != SCV_BYTES ||
+        contractData.durability != TEMPORARY)
+    {
+        return nullptr;
+    }
+    auto const& bytes = contractData.val.bytes();
+
+    ConfigUpgradeSet upgradeSet;
+    try
+    {
+        xdr::xdr_from_opaque(bytes, upgradeSet);
+    }
+    catch (xdr::xdr_runtime_error&)
+    {
+        return nullptr;
+    }
+
+    return std::shared_ptr<ConfigUpgradeSetFrame>(new ConfigUpgradeSetFrame(
+        upgradeSet, key, ls.getLedgerHeader().current().ledgerVersion));
+}
+
+ConfigUpgradeSetFrame::ConfigUpgradeSetFrame(
+    ConfigUpgradeSet const& upgradeSetXDR, ConfigUpgradeSetKey const& key,
+    uint32_t ledgerVersion)
+    : mConfigUpgradeSet(upgradeSetXDR)
+    , mKey(key)
+    , mValidXDR(isValidXDR(upgradeSetXDR, key))
+    , mLedgerVersion(ledgerVersion)
+{
+}
+
+bool
+ConfigUpgradeSetFrame::isValidXDR(ConfigUpgradeSet const& upgradeSetXDR,
+                                  ConfigUpgradeSetKey const& key) const
+{
+    if (key.contentHash != sha256(xdr::xdr_to_opaque(upgradeSetXDR)))
+    {
+        CLOG_DEBUG(Herder,
+                   "Got bad configUpgradeSet. Does not match hash in key {}",
+                   hexAbbrev(key.contentHash));
+        return false;
+    }
+
+    if (upgradeSetXDR.updatedEntry.empty())
+    {
+        CLOG_DEBUG(Herder, "Got bad configUpgradeSet {}: no entries updated",
+                   hexAbbrev(key.contentHash));
+        return false;
+    }
+
+    if (!std::is_sorted(
+            upgradeSetXDR.updatedEntry.begin(),
+            upgradeSetXDR.updatedEntry.end(),
+            [](ConfigSettingEntry const& a, ConfigSettingEntry const& b) {
+                return a.configSettingID() < b.configSettingID();
+            }))
+    {
+        CLOG_DEBUG(Herder,
+                   "Got bad configUpgradeSet {}: the entries are not ordered",
+                   hexAbbrev(key.contentHash));
+        return false;
+    }
+    if (std::adjacent_find(
+            upgradeSetXDR.updatedEntry.begin(),
+            upgradeSetXDR.updatedEntry.end(),
+            [](ConfigSettingEntry const& a, ConfigSettingEntry const& b) {
+                return a.configSettingID() == b.configSettingID();
+            }) != upgradeSetXDR.updatedEntry.end())
+    {
+        CLOG_DEBUG(Herder, "Got bad configUpgradeSet {}: duplicate entry",
+                   hexAbbrev(key.contentHash));
+        return false;
+    }
+    return true;
+}
+
+ConfigUpgradeSet const&
+ConfigUpgradeSetFrame::toXDR() const
+{
+    return mConfigUpgradeSet;
+}
+
+ConfigUpgradeSetKey const&
+ConfigUpgradeSetFrame::getKey() const
+{
+    return mKey;
+}
+
+LedgerKey
+ConfigUpgradeSetFrame::getLedgerKey(ConfigUpgradeSetKey const& upgradeKey)
+{
+    SCVal v;
+    v.type(SCV_BYTES);
+    v.bytes().insert(v.bytes().begin(), upgradeKey.contentHash.begin(),
+                     upgradeKey.contentHash.end());
+
+    LedgerKey lk;
+    lk.type(CONTRACT_DATA);
+    lk.contractData().contract.type(SC_ADDRESS_TYPE_CONTRACT);
+    lk.contractData().contract.contractId() = upgradeKey.contractID;
+    lk.contractData().key = v;
+    lk.contractData().durability = TEMPORARY;
+    return lk;
+}
+
+bool
+ConfigUpgradeSetFrame::upgradeNeeded(LedgerSnapshot const& ls) const
+{
+    if (protocolVersionIsBefore(ls.getLedgerHeader().current().ledgerVersion,
+                                SOROBAN_PROTOCOL_VERSION))
+    {
+        return false;
+    }
+    for (auto const& updatedEntry : mConfigUpgradeSet.updatedEntry)
+    {
+        LedgerKey key(LedgerEntryType::CONFIG_SETTING);
+        key.configSetting().configSettingID = updatedEntry.configSettingID();
+        bool isSame =
+            ls.load(key).current().data.configSetting() == updatedEntry;
+        if (!isSame)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void
+ConfigUpgradeSetFrame::applyTo(AbstractLedgerTxn& ltx) const
+{
+    for (auto const& updatedEntry : mConfigUpgradeSet.updatedEntry)
+    {
+        LedgerKey key(LedgerEntryType::CONFIG_SETTING);
+        auto const id = updatedEntry.configSettingID();
+        key.configSetting().configSettingID = id;
+        ltx.load(key).current().data.configSetting() = updatedEntry;
+    }
+}
+
+bool
+ConfigUpgradeSetFrame::isConsistentWith(
+    ConfigUpgradeSetFrameConstPtr const& scheduledUpgrade) const
+{
+    if (scheduledUpgrade == nullptr)
+    {
+        // We don't have any config upgrades scheduled.
+        return false;
+    }
+    return mKey == scheduledUpgrade->getKey();
+}
+
+Upgrades::UpgradeValidity
+ConfigUpgradeSetFrame::isValidForApply() const
+{
+    if (!mValidXDR)
+    {
+        return Upgrades::UpgradeValidity::XDR_INVALID;
+    }
+    for (auto const& cfg : mConfigUpgradeSet.updatedEntry)
+    {
+        if (!SorobanNetworkConfig::isValidConfigSettingEntry(cfg,
+                                                             mLedgerVersion) ||
+            SorobanNetworkConfig::isNonUpgradeableConfigSettingEntry(cfg))
+        {
+            return Upgrades::UpgradeValidity::INVALID;
+        }
+    }
+    return Upgrades::UpgradeValidity::VALID;
+}
+
+std::string
+ConfigUpgradeSetFrame::encodeAsString() const
+{
+    return decoder::encode_b64(xdr::xdr_to_opaque(mConfigUpgradeSet));
+}
+
+std::string
+ConfigUpgradeSetFrame::toJson() const
+{
+    std::ostringstream out;
+    cereal::JSONOutputArchive ar(out);
+    cereal::save(ar, mConfigUpgradeSet);
+    return out.str();
 }
 }

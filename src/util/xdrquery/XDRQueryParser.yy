@@ -2,7 +2,7 @@
    under the Apache License, Version 2.0. See the COPYING file at the root
    of this distribution or at http://www.apache.org/licenses/LICENSE-2.0 */
 %skeleton "lalr1.cc" /* -*- C++ -*- */
-%require "3.2"
+%require "3.0.4"
 
 %code requires
 {
@@ -19,24 +19,28 @@ YY_DECL;
 
 namespace xdrquery
 {
-std::unique_ptr<BoolEvalNode>
+XDRQueryStatement
 parseXDRQuery(std::string const& query);
 }  // namespace xdrquery
 }
 
 %define api.value.type variant
-%define api.parser.class { XDRQueryParser }
+%define parser_class_name { XDRQueryParser }
 %define api.namespace { xdrquery }
 %define api.token.prefix {TOKEN_}
 %define api.token.constructor
 
-%parse-param { std::unique_ptr<BoolEvalNode>& root }
+%parse-param { XDRQueryStatement& root }
 
 %token <std::string> ID
 %token <std::string> INT
 %token <std::string> STR
 
 %token NULL
+%token SUM
+%token AVG
+%token COUNT
+%token ENTRY_SIZE
 
 %token AND "&&"
 %token OR "||"
@@ -52,56 +56,90 @@ parseXDRQuery(std::string const& query);
 %token RPAREN ")"
 
 %token DOT "."
+%token COMMA ","
+
+%token END 0
 
 %left "||"
 %left "&&"
 %left "==" "!=" ">" ">=" "<" "<="
 
-%type <std::unique_ptr<EvalNode>> literal operand
-%type <std::unique_ptr<BoolEvalNode>> comparison_expr logic_expr
-%type <std::unique_ptr<FieldNode>> field
+%type <std::shared_ptr<EvalNode>> literal operand
+%type <std::shared_ptr<BoolEvalNode>> comparison_expr logic_expr
+%type <std::shared_ptr<ColumnNode>> column
+%type <std::shared_ptr<FieldNode>> field
+%type <std::shared_ptr<EntrySizeNode>> entry_size
+
+%type <std::shared_ptr<Accumulator>> accumulator
+%type <std::shared_ptr<AccumulatorList>> accumulator_list
+
+%type <std::shared_ptr<ColumnList>> column_list
 
 %%
 
 statement: logic_expr { root = std::move($1); }
+         | accumulator_list { root = std::move($1); }
+         | column_list { root = std::move($1); }
 
 logic_expr: comparison_expr { $$ = std::move($1); }
           | "(" logic_expr ")" { $$ = std::move($2); }
           | logic_expr "&&" logic_expr {
-            $$ = std::make_unique<BoolOpNode>(BoolOpNodeType::AND,
+            $$ = std::make_shared<BoolOpNode>(BoolOpNodeType::AND,
                 std::move($1), std::move($3)); }
           | logic_expr "||" logic_expr {
-            $$ = std::make_unique<BoolOpNode>(BoolOpNodeType::OR,
+            $$ = std::make_shared<BoolOpNode>(BoolOpNodeType::OR,
                 std::move($1), std::move($3)); }
 
 comparison_expr: operand "==" operand {
-        $$ = std::make_unique<ComparisonNode>(ComparisonNodeType::EQ,
+        $$ = std::make_shared<ComparisonNode>(ComparisonNodeType::EQ,
                 std::move($1), std::move($3)); }
     | operand "!=" operand {
-        $$ = std::make_unique<ComparisonNode>(ComparisonNodeType::NE,
+        $$ = std::make_shared<ComparisonNode>(ComparisonNodeType::NE,
                 std::move($1), std::move($3)); }
     | operand "<" operand {
-        $$ = std::make_unique<ComparisonNode>(ComparisonNodeType::LT,
+        $$ = std::make_shared<ComparisonNode>(ComparisonNodeType::LT,
                 std::move($1), std::move($3)); }
     | operand "<=" operand {
-        $$ = std::make_unique<ComparisonNode>(ComparisonNodeType::LE,
+        $$ = std::make_shared<ComparisonNode>(ComparisonNodeType::LE,
                 std::move($1), std::move($3)); }
     | operand ">" operand {
-        $$ = std::make_unique<ComparisonNode>(ComparisonNodeType::GT,
+        $$ = std::make_shared<ComparisonNode>(ComparisonNodeType::GT,
                 std::move($1), std::move($3)); }
     | operand ">=" operand {
-        $$ = std::make_unique<ComparisonNode>(ComparisonNodeType::GE,
+        $$ = std::make_shared<ComparisonNode>(ComparisonNodeType::GE,
                 std::move($1), std::move($3)); }
 
 operand: literal { $$ = std::move($1); }
-       | field { $$ = std::move($1); }
+       | column { $$ = std::move($1); }
 
-literal: INT { $$ = std::make_unique<LiteralNode>(LiteralNodeType::INT, $1); }
-       | STR { $$ = std::make_unique<LiteralNode>(LiteralNodeType::STR, $1); }
-       | NULL { $$ = std::make_unique<LiteralNode>(LiteralNodeType::NULL_LITERAL, ""); }
+literal: INT { $$ = std::make_shared<LiteralNode>(LiteralNodeType::INT, $1); }
+       | STR { $$ = std::make_shared<LiteralNode>(LiteralNodeType::STR, $1); }
+       | NULL { $$ = std::make_shared<LiteralNode>(LiteralNodeType::NULL_LITERAL, ""); }
 
-field: ID { $$ = std::make_unique<FieldNode>($1); }
+column: field { $$ = std::move($1); }
+      | entry_size { $$ = std::move($1); }
+
+entry_size: ENTRY_SIZE "(" ")" { $$ = std::make_shared<EntrySizeNode>(); }
+
+field: ID { $$ = std::make_shared<FieldNode>($1); }
      | field "." ID { $1->mFieldPath.push_back($3); $$ = std::move($1); }
+
+accumulator_list: accumulator { $$ = std::make_shared<AccumulatorList>(std::move($1)); }
+                | accumulator_list "," accumulator { $1->addAccumulator($3); $$ = std::move($1); }
+
+accumulator: COUNT "(" ")" { 
+                $$ = std::make_shared<Accumulator>(AccumulatorType::COUNT); }
+           | SUM "(" column ")" {
+                $$ = std::make_shared<Accumulator>(
+                    AccumulatorType::SUM, std::move($3));
+           }
+           | AVG "(" column ")" {
+                $$ = std::make_shared<Accumulator>(
+                    AccumulatorType::AVERAGE, std::move($3));
+           }
+
+column_list: column { $$ = std::make_shared<ColumnList>(std::move($1)); }
+           | column_list "," column { $1->addColumn($3); $$ = std::move($1); }
 
 %%
 
@@ -130,7 +168,7 @@ XDRQueryParser::error(std::string const& error)
     throw XDRQueryError("Parsing error: '" + error + "'.");
 }
 
-std::unique_ptr<BoolEvalNode>
+XDRQueryStatement
 parseXDRQuery(std::string const& query)
 {
     // LeakSantizer (likely) incorrectly identifies some small leaks in 
@@ -141,13 +179,13 @@ parseXDRQuery(std::string const& query)
     __lsan_disable();
 #endif    
     beginScan(query.c_str());
-    std::unique_ptr<BoolEvalNode> root;
+    XDRQueryStatement root;
     XDRQueryParser parser(root);
-    parser();
+    parser.parse();
     endScan();
 #ifdef ASAN_ENABLED
     __lsan_enable();
-#endif    
+#endif
     return root;
 }
 }  // namespace xdrquery

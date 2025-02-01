@@ -1,16 +1,21 @@
 /* Copyright 2022 Stellar Development Foundation and contributors. Licensed
    under the Apache License, Version 2.0. See the COPYING file at the root
    of this distribution or at http://www.apache.org/licenses/LICENSE-2.0 */
-%{
+%top{
 #ifdef _MSC_VER
+#include <stdint.h>
 #include <io.h>
 #define popen _popen
 #define pclose _pclose
 #define access _access
 #define isatty _isatty
 #define fileno _fileno
-#else
+#endif
+}
+%{
+#ifndef _MSC_VER
 #include <unistd.h>
+#define register
 #endif
 
 #include "util/xdrquery/XDRQueryParser.h"
@@ -29,6 +34,11 @@ WHITESPACE [ \t\r\n]
 
 NULL  { return xdrquery::XDRQueryParser::make_NULL(); }
 
+sum { return xdrquery::XDRQueryParser::make_SUM(); }
+avg { return xdrquery::XDRQueryParser::make_AVG(); }
+count { return xdrquery::XDRQueryParser::make_COUNT(); }
+entry_size { return xdrquery::XDRQueryParser::make_ENTRY_SIZE(); }
+
 {IDENTIFIER}  { return xdrquery::XDRQueryParser::make_ID(yytext); }
 {INT}         { return xdrquery::XDRQueryParser::make_INT(yytext); }
 
@@ -46,6 +56,7 @@ NULL  { return xdrquery::XDRQueryParser::make_NULL(); }
 ")"   { return xdrquery::XDRQueryParser::make_RPAREN(); }
 
 "."   { return xdrquery::XDRQueryParser::make_DOT(); }
+","   { return xdrquery::XDRQueryParser::make_COMMA(); }
 
 {STRING} { 
     std::string s(yytext + 1); 
@@ -54,6 +65,8 @@ NULL  { return xdrquery::XDRQueryParser::make_NULL(); }
 }
 
 {WHITESPACE}+ /* discard */;
+
+<<EOF>> { return xdrquery::XDRQueryParser::make_END(); }
 
 .     { throw xdrquery::XDRQueryParser::syntax_error("Unexpected character: " + std::string(yytext)); }
 

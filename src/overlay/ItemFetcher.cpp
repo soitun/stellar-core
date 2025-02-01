@@ -4,16 +4,11 @@
 
 #include "overlay/ItemFetcher.h"
 #include "crypto/Hex.h"
-#include "crypto/SHA.h"
 #include "herder/Herder.h"
 #include "herder/TxSetFrame.h"
 #include "main/Application.h"
-#include "medida/metrics_registry.h"
-#include "overlay/OverlayManager.h"
-#include "overlay/StellarXDR.h"
 #include "overlay/Tracker.h"
 #include "util/Logging.h"
-#include "xdrpp/marshal.h"
 #include <Tracy.hpp>
 
 namespace stellar
@@ -100,22 +95,24 @@ ItemFetcher::fetchingFor(Hash const& itemHash) const
 }
 
 void
-ItemFetcher::stopFetchingBelow(uint64 slotIndex)
+ItemFetcher::stopFetchingBelow(uint64 slotIndex, uint64 slotToKeep)
 {
     // only perform this cleanup from the top of the stack as it causes
     // all sorts of evil side effects
     mApp.postOnMainThread(
-        [this, slotIndex]() { stopFetchingBelowInternal(slotIndex); },
+        [this, slotIndex, slotToKeep]() {
+            stopFetchingBelowInternal(slotIndex, slotToKeep);
+        },
         "ItemFetcher: stopFetchingBelow");
 }
 
 void
-ItemFetcher::stopFetchingBelowInternal(uint64 slotIndex)
+ItemFetcher::stopFetchingBelowInternal(uint64 slotIndex, uint64 slotToKeep)
 {
     ZoneScoped;
     for (auto iter = mTrackers.begin(); iter != mTrackers.end();)
     {
-        if (!iter->second->clearEnvelopesBelow(slotIndex))
+        if (!iter->second->clearEnvelopesBelow(slotIndex, slotToKeep))
         {
             iter = mTrackers.erase(iter);
         }

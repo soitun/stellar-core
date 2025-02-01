@@ -9,12 +9,15 @@
 #include "xdr/Stellar-ledger-entries.h"
 #include "xdr/Stellar-ledger.h"
 #include "xdr/Stellar-transaction.h"
+
 #include <algorithm>
+#include <optional>
 
 namespace stellar
 {
 
 class Application;
+class Config;
 class ConstLedgerTxnEntry;
 class ConstTrustLineWrapper;
 class AbstractLedgerTxn;
@@ -22,6 +25,10 @@ class LedgerTxnEntry;
 class LedgerTxnHeader;
 class TrustLineWrapper;
 class InternalLedgerKey;
+class SorobanNetworkConfig;
+class TransactionFrame;
+class TransactionFrameBase;
+class SorobanTxData;
 struct ClaimAtom;
 struct LedgerHeader;
 struct LedgerKey;
@@ -62,10 +69,11 @@ LedgerKey claimableBalanceKey(ClaimableBalanceID const& balanceID);
 LedgerKey liquidityPoolKey(PoolID const& poolID);
 LedgerKey poolShareTrustLineKey(AccountID const& accountID,
                                 PoolID const& poolID);
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 LedgerKey configSettingKey(ConfigSettingID const& configSettingID);
-LedgerKey contractDataKey(Hash const& contractID, SCVal const& dataKey);
-#endif
+LedgerKey contractDataKey(SCAddress const& contract, SCVal const& dataKey,
+                          ContractDataDurability type);
+LedgerKey contractCodeKey(Hash const& hash);
+
 InternalLedgerKey sponsorshipKey(AccountID const& sponsoredID);
 InternalLedgerKey sponsorshipCounterKey(AccountID const& sponsoringID);
 InternalLedgerKey maxSeqNumToApplyKey(AccountID const& sourceAccount);
@@ -138,10 +146,11 @@ LedgerTxnEntry loadPoolShareTrustLine(AbstractLedgerTxn& ltx,
 
 LedgerTxnEntry loadLiquidityPool(AbstractLedgerTxn& ltx, PoolID const& poolID);
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-LedgerTxnEntry loadContractData(AbstractLedgerTxn& ltx, Hash const& contractID,
-                                SCVal const& dataKey);
-#endif
+ConstLedgerTxnEntry loadContractData(AbstractLedgerTxn& ltx,
+                                     SCAddress const& contract,
+                                     SCVal const& dataKey,
+                                     ContractDataDurability type);
+ConstLedgerTxnEntry loadContractCode(AbstractLedgerTxn& ltx, Hash const& hash);
 
 void acquireLiabilities(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
                         LedgerTxnEntry const& offer);
@@ -205,6 +214,7 @@ int64_t getSellingLiabilities(LedgerTxnHeader const& header,
 
 SequenceNumber getStartingSequenceNumber(uint32_t ledgerSeq);
 SequenceNumber getStartingSequenceNumber(LedgerTxnHeader const& header);
+SequenceNumber getStartingSequenceNumber(LedgerHeader const& header);
 
 bool isAuthorized(LedgerEntry const& le);
 bool isAuthorized(LedgerTxnEntry const& entry);
@@ -250,6 +260,9 @@ bool accountFlagMaskCheckIsValid(uint32_t flag, uint32_t ledgerVersion);
 
 bool hasMuxedAccount(TransactionEnvelope const& e);
 
+bool isTransactionXDRValidForProtocol(uint32_t currProtocol, Config const& cfg,
+                                      TransactionEnvelope const& envelope);
+
 uint64_t getUpperBoundCloseTimeOffset(Application& app, uint64_t lastCloseTime);
 
 bool hasAccountEntryExtV2(AccountEntry const& ae);
@@ -291,4 +304,37 @@ int64_t getPoolWithdrawalAmount(int64_t amountPoolShares,
 
 void maybeUpdateAccountOnLedgerSeqUpdate(LedgerTxnHeader const& header,
                                          LedgerTxnEntry& account);
+
+// Get min _inclusion_ fee needed for this transaction to get included
+int64_t getMinInclusionFee(TransactionFrameBase const& tx,
+                           LedgerHeader const& header,
+                           std::optional<int64_t> baseFee = std::nullopt);
+
+bool validateContractLedgerEntry(LedgerKey const& lk, size_t entrySize,
+                                 SorobanNetworkConfig const& config,
+                                 Config const& appConfig,
+                                 TransactionFrame const& parentTx,
+                                 SorobanTxData& sorobanData);
+
+struct LumenContractInfo
+{
+    Hash mLumenContractID;
+    SCVal mBalanceSymbol;
+    SCVal mAmountSymbol;
+};
+LumenContractInfo getLumenContractInfo(Hash const& networkID);
+
+SCVal makeSymbolSCVal(std::string&& str);
+SCVal makeSymbolSCVal(std::string const& str);
+SCVal makeStringSCVal(std::string&& str);
+SCVal makeU64SCVal(uint64_t u);
+template <typename T>
+SCVal
+makeBytesSCVal(T const& bytes)
+{
+    SCVal val(SCV_BYTES);
+    val.bytes().assign(bytes.begin(), bytes.end());
+    return val;
+}
+SCVal makeAddressSCVal(SCAddress const& address);
 }

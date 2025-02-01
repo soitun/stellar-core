@@ -25,6 +25,8 @@ class Timer;
 
 namespace stellar
 {
+constexpr uint32 const SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER = 2;
+
 class Application;
 class LedgerManager;
 class HerderSCPDriver;
@@ -73,7 +75,8 @@ class HerderImpl : public Herder
 
     void start() override;
 
-    void lastClosedLedgerIncreased() override;
+    void lastClosedLedgerIncreased(bool latest,
+                                   TxSetXDRFrameConstPtr txSet) override;
 
     SCP& getSCP();
     HerderSCPDriver&
@@ -83,12 +86,13 @@ class HerderImpl : public Herder
     }
 
     bool
-    isTracking() const
+    isTracking() const override
     {
         return mState == State::HERDER_TRACKING_NETWORK_STATE;
     }
 
-    void processExternalized(uint64 slotIndex, StellarValue const& value);
+    void processExternalized(uint64 slotIndex, StellarValue const& value,
+                             bool isLatestSlot);
     void valueExternalized(uint64 slotIndex, StellarValue const& value,
                            bool isLatestSlot);
     void emitEnvelope(SCPEnvelope const& envelope);
@@ -101,9 +105,12 @@ class HerderImpl : public Herder
 #ifdef BUILD_TESTS
     EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,
                                    const SCPQuorumSet& qset,
-                                   TxSetFrame txset) override;
+                                   TxSetXDRFrameConstPtr txset) override;
+    EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,
+                                   const SCPQuorumSet& qset,
+                                   StellarMessage const& txset) override;
 
-    void externalizeValue(TxSetFrameConstPtr txSet, uint32_t ledgerSeq,
+    void externalizeValue(TxSetXDRFrameConstPtr txSet, uint32_t ledgerSeq,
                           uint64_t closeTime,
                           xdr::xvector<UpgradeType, 6> const& upgrades,
                           std::optional<SecretKey> skToSignValue) override;
@@ -115,17 +122,44 @@ class HerderImpl : public Herder
     }
 
     uint32_t mTriggerNextLedgerSeq{0};
+
+    std::optional<uint32_t> mMaxClassicTxSize;
+    void
+    setMaxClassicTxSize(uint32 bytes) override
+    {
+        mMaxClassicTxSize = std::make_optional<uint32_t>(bytes);
+    }
+    void
+    setMaxTxSize(uint32 bytes) override
+    {
+        mMaxTxSize = bytes;
+    }
+    std::optional<uint32_t> mFlowControlExtraBuffer;
+    void
+    setFlowControlExtraBufferSize(uint32 bytes) override
+    {
+        mFlowControlExtraBuffer = std::make_optional<uint32_t>(bytes);
+    }
 #endif
     void sendSCPStateToPeer(uint32 ledgerSeq, Peer::pointer peer) override;
 
     bool recvSCPQuorumSet(Hash const& hash, const SCPQuorumSet& qset) override;
-    bool recvTxSet(Hash const& hash, const TxSetFrame& txset) override;
+    bool recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset) override;
     void peerDoesntHave(MessageType type, uint256 const& itemID,
                         Peer::pointer peer) override;
-    TxSetFrameConstPtr getTxSet(Hash const& hash) override;
+    TxSetXDRFrameConstPtr getTxSet(Hash const& hash) override;
     SCPQuorumSetPtr getQSet(Hash const& qSetHash) override;
 
     void processSCPQueue();
+
+    uint32_t getMaxClassicTxSize() const override;
+    uint32_t getFlowControlExtraBuffer() const override;
+
+    uint32_t
+    getMaxTxSize() const override
+    {
+        return mMaxTxSize;
+    }
 
     uint32 getMinLedgerSeqToAskPeers() const override;
 
@@ -134,7 +168,7 @@ class HerderImpl : public Herder
     bool isNewerNominationOrBallotSt(SCPStatement const& oldSt,
                                      SCPStatement const& newSt) override;
 
-    SequenceNumber getMaxSeqInPendingTxs(AccountID const&) override;
+    uint32_t getMostRecentCheckpointSeq() override;
 
     void triggerNextLedger(uint32_t ledgerSeqToTrigger,
                            bool checkTrackingSCP) override;
@@ -162,11 +196,17 @@ class HerderImpl : public Herder
                      xdr::xvector<UpgradeType, 6> const& upgrades,
                      SecretKey const& s) override;
 
+    virtual void beginApply() override;
+
+    void startTxSetGCTimer();
+
 #ifdef BUILD_TESTS
     // used for testing
     PendingEnvelopes& getPendingEnvelopes();
 
-    TransactionQueue& getTransactionQueue();
+    ClassicTransactionQueue& getTransactionQueue() override;
+    SorobanTransactionQueue& getSorobanTransactionQueue() override;
+    bool sourceAccountPending(AccountID const& accountID) const override;
 #endif
 
     // helper function to verify envelopes are signed
@@ -176,6 +216,13 @@ class HerderImpl : public Herder
 
     // helper function to verify SCPValues are signed
     bool verifyStellarValueSignature(StellarValue const& sv);
+
+    size_t getMaxQueueSizeOps() const override;
+    size_t getMaxQueueSizeSorobanOps() const override;
+    void maybeHandleUpgrade() override;
+
+    bool isBannedTx(Hash const& hash) const override;
+    TransactionFrameBaseConstPtr getTx(Hash const& hash) const override;
 
   private:
     // return true if values referenced by envelope have a valid close time:
@@ -198,11 +245,14 @@ class HerderImpl : public Herder
     void processSCPQueueUpToIndex(uint64 slotIndex);
     void safelyProcessSCPQueue(bool synchronous);
     void newSlotExternalized(bool synchronous, StellarValue const& value);
+    void purgeOldPersistedTxSets();
+    void writeDebugTxSet(LedgerCloseData const& lcd);
 
-    TransactionQueue mTransactionQueue;
+    ClassicTransactionQueue mTransactionQueue;
+    std::unique_ptr<SorobanTransactionQueue> mSorobanTransactionQueue;
 
-    void
-    updateTransactionQueue(std::vector<TransactionFrameBasePtr> const& applied);
+    void updateTransactionQueue(TxSetXDRFrameConstPtr txSet);
+    void maybeSetupSorobanQueue(uint32_t protocolVersion);
 
     PendingEnvelopes mPendingEnvelopes;
     Upgrades mUpgrades;
@@ -228,6 +278,11 @@ class HerderImpl : public Herder
     // restores SCP state based on the last messages saved on disk
     void restoreSCPState();
 
+    // Map SCP slots to local time of nomination and the time slot was
+    // externalized by the network
+    std::map<uint32_t, std::pair<uint64_t, std::optional<uint64_t>>>
+        mDriftCTSlidingWindow;
+
     // saves upgrade parameters
     void persistUpgrades();
     void restoreUpgrades();
@@ -240,6 +295,8 @@ class HerderImpl : public Herder
     VirtualTimer mTriggerTimer;
 
     VirtualTimer mOutOfSyncTimer;
+
+    VirtualTimer mTxSetGarbageCollectTimer;
 
     Application& mApp;
     LedgerManager& mLedgerManager;
@@ -268,7 +325,9 @@ class HerderImpl : public Herder
     // run a background job that re-analyzes the current quorum map.
     void checkAndMaybeReanalyzeQuorumMap();
 
-    // erase all data for ledgers strictly less than ledgerSeq
+    // erase all data for ledgers strictly less than ledgerSeq except for the
+    // first ledger on the current checkpoint. Hold onto this ledger so
+    // peers can catchup without waiting for the next checkpoint.
     void eraseBelow(uint32 ledgerSeq);
 
     struct QuorumMapIntersectionState
@@ -306,5 +365,7 @@ class HerderImpl : public Herder
     // network or not (Herder::State is used to properly track the state of
     // Herder) On startup, this variable is set to LCL
     ConsensusData mTrackingSCP;
+
+    uint32_t mMaxTxSize{0};
 };
 }

@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "test/TestExceptions.h"
+#include "xdr/Stellar-transaction.h"
 
 namespace stellar
 {
@@ -511,6 +512,56 @@ throwIf(LiquidityPoolWithdrawResult const& result)
 }
 
 void
+throwIf(InvokeHostFunctionResult const& result)
+{
+    switch (result.code())
+    {
+    case INVOKE_HOST_FUNCTION_MALFORMED:
+        throw ex_INVOKE_HOST_FUNCTION_MALFORMED{};
+    case INVOKE_HOST_FUNCTION_TRAPPED:
+        throw ex_INVOKE_HOST_FUNCTION_TRAPPED{};
+    case INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED:
+        throw ex_INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED{};
+    case INVOKE_HOST_FUNCTION_SUCCESS:
+        break;
+    default:
+        throw ex_UNKNOWN{};
+    }
+}
+
+void
+throwIf(ExtendFootprintTTLResult const& result)
+{
+    switch (result.code())
+    {
+    case EXTEND_FOOTPRINT_TTL_MALFORMED:
+        throw ex_EXTEND_FOOTPRINT_TTL_MALFORMED{};
+    case EXTEND_FOOTPRINT_TTL_RESOURCE_LIMIT_EXCEEDED:
+        throw ex_EXTEND_FOOTPRINT_TTL_RESOURCE_LIMIT_EXCEEDED{};
+    case EXTEND_FOOTPRINT_TTL_SUCCESS:
+        break;
+    default:
+        throw ex_UNKNOWN{};
+    }
+}
+
+void
+throwIf(RestoreFootprintResult const& result)
+{
+    switch (result.code())
+    {
+    case RESTORE_FOOTPRINT_MALFORMED:
+        throw ex_RESTORE_FOOTPRINT_MALFORMED{};
+    case RESTORE_FOOTPRINT_RESOURCE_LIMIT_EXCEEDED:
+        throw ex_RESTORE_FOOTPRINT_RESOURCE_LIMIT_EXCEEDED{};
+    case RESTORE_FOOTPRINT_SUCCESS:
+        break;
+    default:
+        throw ex_UNKNOWN{};
+    }
+}
+
+void
 throwIf(TransactionResult const& result)
 {
     switch (result.result.code())
@@ -607,7 +658,6 @@ throwIf(TransactionResult const& result)
     case END_SPONSORING_FUTURE_RESERVES:
     case REVOKE_SPONSORSHIP:
         // Sponsorship tests catch error codes at a higher level than this.
-        throw std::runtime_error("got error-result in test sponsorship tx");
         break;
     case CLAWBACK:
         throwIf(opResult.tr().clawbackResult());
@@ -623,6 +673,15 @@ throwIf(TransactionResult const& result)
         break;
     case LIQUIDITY_POOL_WITHDRAW:
         throwIf(opResult.tr().liquidityPoolWithdrawResult());
+        break;
+    case INVOKE_HOST_FUNCTION:
+        throwIf(opResult.tr().invokeHostFunctionResult());
+        break;
+    case EXTEND_FOOTPRINT_TTL:
+        throwIf(opResult.tr().extendFootprintTTLResult());
+        break;
+    case RESTORE_FOOTPRINT:
+        throwIf(opResult.tr().restoreFootprintResult());
         break;
     }
 }

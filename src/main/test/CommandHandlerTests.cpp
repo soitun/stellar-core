@@ -34,13 +34,15 @@ TEST_CASE_VERSIONS("transaction envelope bridge", "[commandhandler]")
     auto& ch = app->getCommandHandler();
     auto baseFee = app->getLedgerManager().getLastTxFee();
 
-    std::string const PENDING_RESULT = "{\"status\": \"PENDING\"}";
+    std::string const PENDING_RESULT = "{\"status\":\"PENDING\"}\n";
     auto errorResult = [](TransactionResultCode resultCode, int64_t fee) {
         TransactionResult txRes;
         txRes.feeCharged = fee;
         txRes.result.code(resultCode);
         auto inner = decoder::encode_b64(xdr::xdr_to_opaque(txRes));
-        return "{\"status\": \"ERROR\" , \"error\": \"" + inner + "\"}";
+        return
+
+            std::string("{\"error\":\"") + inner + "\",\"status\":\"ERROR\"}\n";
     };
 
     auto sign = [&](auto& signatures, SecretKey const& key, auto... input) {
@@ -502,12 +504,13 @@ TEST_CASE("manualclose", "[commandhandler]")
                 lastCloseTime() + defaultManualCloseTimeInterval +
                 getUpperBoundCloseTimeOffset(*app, lastCloseTime());
             setMaxTime(txFrame, maxTime);
-            txFrame->getEnvelope().v1().signatures.clear();
+            txFrame->getMutableEnvelope().v1().signatures.clear();
             txFrame->addSignature(root);
 
             {
                 LedgerTxn checkLtx(app->getLedgerTxnRoot());
-                auto valid = txFrame->checkValid(checkLtx, 0, 0, 0);
+                auto valid = txFrame->checkValidForTesting(
+                    app->getAppConnector(), checkLtx, 0, 0, 0);
                 REQUIRE(valid);
             }
 

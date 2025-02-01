@@ -5,7 +5,6 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "overlay/Peer.h"
-#include "overlay/StellarXDR.h"
 #include <map>
 
 /**
@@ -29,6 +28,8 @@ class Counter;
 namespace stellar
 {
 
+struct StellarMessage;
+
 class Floodgate
 {
     class FloodRecord
@@ -37,17 +38,16 @@ class Floodgate
         typedef std::shared_ptr<FloodRecord> pointer;
 
         uint32_t mLedgerSeq;
-        StellarMessage mMessage;
         std::set<std::string> mPeersTold;
 
-        FloodRecord(StellarMessage const& msg, uint32_t ledger,
-                    Peer::pointer peer);
+        FloodRecord(uint32_t ledger, Peer::pointer peer);
     };
 
     std::map<Hash, FloodRecord::pointer> mFloodMap;
     Application& mApp;
     medida::Counter& mFloodMapSize;
     medida::Meter& mSendFromBroadcast;
+    medida::Meter& mMessagesAdvertised;
     bool mShuttingDown;
 
   public:
@@ -57,10 +57,15 @@ class Floodgate
     // returns true if this is a new record
     // fills msgID with msg's hash
     bool addRecord(StellarMessage const& msg, Peer::pointer fromPeer,
-                   Hash& msgID);
+                   Hash const& msgID);
 
     // returns true if msg was sent to at least one peer
-    bool broadcast(StellarMessage const& msg, bool force);
+    // The hash required for transactions
+    // `minOverlayVersion` is the minimum overlay version a peer must have in
+    // order to be sent the message.
+    bool broadcast(std::shared_ptr<StellarMessage const> msg,
+                   std::optional<Hash> const& hash = std::nullopt,
+                   uint32_t minOverlayVersion = 0);
 
     // returns the list of peers that sent us the item with hash `msgID`
     // NB: `msgID` is the hash of a `StellarMessage`
@@ -71,8 +76,5 @@ class Floodgate
     void forgetRecord(Hash const& msgID);
 
     void shutdown();
-
-    void updateRecord(StellarMessage const& oldMsg,
-                      StellarMessage const& newMsg);
 };
 }

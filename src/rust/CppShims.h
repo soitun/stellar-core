@@ -12,8 +12,19 @@
 // constructors, etc). We isolate them in this file to avoid polluting normal
 // C++ code with too much interop glue.
 
+namespace rust
+{
+inline namespace cxxbridge1
+{
+template <typename T> class Vec;
+}
+}
+struct CxxBuf;
 namespace stellar
 {
+class Application;
+struct HostFunctionMetrics;
+
 inline bool
 shim_isLogLevelAtLeast(std::string const& partition, LogLevel level)
 {

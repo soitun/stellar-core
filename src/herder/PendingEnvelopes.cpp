@@ -60,7 +60,11 @@ PendingEnvelopes::peerDoesntHave(MessageType type, Hash const& itemID,
 {
     switch (type)
     {
+    // Subtle: it is important to treat both TX_SET and GENERALIZED_TX_SET the
+    // same way here, since the sending node may have the type wrong depending
+    // on the protocol version
     case TX_SET:
+    case GENERALIZED_TX_SET:
         mTxSetFetcher.doesntHave(itemID, peer);
         break;
     case SCP_QUORUMSET:
@@ -176,9 +180,9 @@ PendingEnvelopes::updateMetrics()
     mReadyCount.set_count(ready);
 }
 
-TxSetFrameConstPtr
+TxSetXDRFrameConstPtr
 PendingEnvelopes::putTxSet(Hash const& hash, uint64 slot,
-                           TxSetFrameConstPtr txset)
+                           TxSetXDRFrameConstPtr txset)
 {
     auto res = getKnownTxSet(hash, slot, true);
     if (!res)
@@ -193,12 +197,12 @@ PendingEnvelopes::putTxSet(Hash const& hash, uint64 slot,
 // tries to find a txset in memory, setting touch also touches the LRU,
 // extending the lifetime of the result *and* updating the slot number
 // to a greater value if needed
-TxSetFrameConstPtr
+TxSetXDRFrameConstPtr
 PendingEnvelopes::getKnownTxSet(Hash const& hash, uint64 slot, bool touch)
 {
     // slot is only used when `touch` is set
     releaseAssert(touch || (slot == 0));
-    TxSetFrameConstPtr res;
+    TxSetXDRFrameConstPtr res;
     auto it = mKnownTxSets.find(hash);
     if (it != mKnownTxSets.end())
     {
@@ -224,7 +228,7 @@ PendingEnvelopes::getKnownTxSet(Hash const& hash, uint64 slot, bool touch)
 
 void
 PendingEnvelopes::addTxSet(Hash const& hash, uint64 lastSeenSlotIndex,
-                           TxSetFrameConstPtr txset)
+                           TxSetXDRFrameConstPtr txset)
 {
     ZoneScoped;
     CLOG_TRACE(Herder, "Add TxSet {}", hexAbbrev(hash));
@@ -234,7 +238,7 @@ PendingEnvelopes::addTxSet(Hash const& hash, uint64 lastSeenSlotIndex,
 }
 
 bool
-PendingEnvelopes::recvTxSet(Hash const& hash, TxSetFrameConstPtr txset)
+PendingEnvelopes::recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset)
 {
     ZoneScoped;
     CLOG_TRACE(Herder, "Got TxSet {}", hexAbbrev(hash));
@@ -482,9 +486,7 @@ PendingEnvelopes::recordReceivedCost(SCPEnvelope const& env)
             auto txSetPtr = getTxSet(v.txSetHash);
             if (txSetPtr)
             {
-                TransactionSet txSet;
-                txSetPtr->toXDR(txSet);
-                txSetSize = xdr::xdr_argpack_size(txSet);
+                txSetSize = txSetPtr->encodedSize();
                 mValueSizeCache.put(v.txSetHash, txSetSize);
             }
         }
@@ -537,9 +539,9 @@ PendingEnvelopes::envelopeReady(SCPEnvelope const& envelope)
     // envelope.
     recordReceivedCost(envelope);
 
-    StellarMessage msg;
-    msg.type(SCP_MESSAGE);
-    msg.envelope() = envelope;
+    auto msg = std::make_shared<StellarMessage>();
+    msg->type(SCP_MESSAGE);
+    msg->envelope() = envelope;
     mApp.getOverlayManager().broadcastMessage(msg);
 
     auto envW = mHerder.getHerderSCPDriver().wrapEnvelope(envelope);
@@ -656,9 +658,9 @@ PendingEnvelopes::readySlots()
 }
 
 void
-PendingEnvelopes::eraseBelow(uint64 slotIndex)
+PendingEnvelopes::eraseBelow(uint64 slotIndex, uint64 slotToKeep)
 {
-    stopAllBelow(slotIndex);
+    stopAllBelow(slotIndex, slotToKeep);
 
     // report only for the highest slot that we're purging
     reportCostOutliersForSlot(slotIndex - 1, true);
@@ -667,7 +669,14 @@ PendingEnvelopes::eraseBelow(uint64 slotIndex)
     {
         if (iter->first < slotIndex)
         {
-            iter = mEnvelopes.erase(iter);
+            if (iter->first == slotToKeep)
+            {
+                ++iter;
+            }
+            else
+            {
+                iter = mEnvelopes.erase(iter);
+            }
         }
         else
             break;
@@ -676,7 +685,7 @@ PendingEnvelopes::eraseBelow(uint64 slotIndex)
     // 0 is special mark for data that we do not know the slot index
     // it is used for state loaded from database
     mTxSetCache.erase_if([&](TxSetFramCacheItem const& i) {
-        return i.first != 0 && i.first < slotIndex;
+        return i.first != 0 && i.first < slotIndex && i.first != slotToKeep;
     });
 
     cleanKnownData();
@@ -684,21 +693,26 @@ PendingEnvelopes::eraseBelow(uint64 slotIndex)
 }
 
 void
-PendingEnvelopes::stopAllBelow(uint64 slotIndex)
+PendingEnvelopes::stopAllBelow(uint64 slotIndex, uint64 slotToKeep)
 {
     // Before we purge a slot, check if any envelopes are still in
     // "fetching" mode and attempt to record cost
     for (auto it = mEnvelopes.begin();
          it != mEnvelopes.end() && it->first < slotIndex; it++)
     {
+        if (it->first == slotToKeep)
+        {
+            continue;
+        }
+
         auto& envs = it->second;
         for (auto const& env : envs.mFetchingEnvelopes)
         {
             recordReceivedCost(env.first);
         }
     }
-    mTxSetFetcher.stopFetchingBelow(slotIndex);
-    mQuorumSetFetcher.stopFetchingBelow(slotIndex);
+    mTxSetFetcher.stopFetchingBelow(slotIndex, slotToKeep);
+    mQuorumSetFetcher.stopFetchingBelow(slotIndex, slotToKeep);
 }
 
 void
@@ -708,7 +722,7 @@ PendingEnvelopes::forceRebuildQuorum()
     mRebuildQuorum = true;
 }
 
-TxSetFrameConstPtr
+TxSetXDRFrameConstPtr
 PendingEnvelopes::getTxSet(Hash const& hash)
 {
     return getKnownTxSet(hash, 0, false);
@@ -731,7 +745,7 @@ PendingEnvelopes::getQSet(Hash const& hash)
     else
     {
         auto& db = mApp.getDatabase();
-        qset = HerderPersistence::getQuorumSet(db, db.getSession(), hash);
+        qset = HerderPersistence::getQuorumSet(db, db.getRawSession(), hash);
     }
     if (qset)
     {
@@ -800,7 +814,7 @@ PendingEnvelopes::rebuildQuorumTrackerState()
                 // see if we had some information for that node
                 auto& db = mApp.getDatabase();
                 auto h = HerderPersistence::getNodeQuorumSet(
-                    db, db.getSession(), id);
+                    db, db.getRawSession(), id);
                 if (h)
                 {
                     res = getQSet(*h);

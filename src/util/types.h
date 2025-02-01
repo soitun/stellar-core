@@ -4,15 +4,18 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "numeric.h"
-#include "overlay/StellarXDR.h"
-#include "xdrpp/message.h"
-#include <type_traits>
+#include "bucket/LedgerCmp.h"
+#include "xdr/Stellar-ledger-entries.h"
+#include "xdr/Stellar-ledger.h"
+#include "xdr/Stellar-types.h"
+#include <set>
 #include <vector>
 
 namespace stellar
 {
 typedef std::vector<unsigned char> Blob;
+
+typedef std::set<LedgerKey, LedgerEntryIdCmp> LedgerKeySet;
 
 LedgerKey LedgerEntryKey(LedgerEntry const& e);
 
@@ -124,6 +127,46 @@ assetToString(const Asset& asset)
     }
     return r;
 };
+
+inline LedgerKey
+getBucketLedgerKey(HotArchiveBucketEntry const& be)
+{
+    switch (be.type())
+    {
+    case HOT_ARCHIVE_LIVE:
+    case HOT_ARCHIVE_DELETED:
+        return be.key();
+    case HOT_ARCHIVE_ARCHIVED:
+        return LedgerEntryKey(be.archivedEntry());
+    case HOT_ARCHIVE_METAENTRY:
+    default:
+        throw std::invalid_argument("Tried to get key for METAENTRY");
+    }
+}
+
+inline LedgerKey
+getBucketLedgerKey(BucketEntry const& be)
+{
+    switch (be.type())
+    {
+    case LIVEENTRY:
+    case INITENTRY:
+        return LedgerEntryKey(be.liveEntry());
+    case DEADENTRY:
+        return be.deadEntry();
+    case METAENTRY:
+    default:
+        throw std::invalid_argument("Tried to get key for METAENTRY");
+    }
+}
+
+// Round value v down to largest multiple of m, m must be power of 2
+template <typename T>
+inline T
+roundDown(T v, T m)
+{
+    return v & ~(m - 1);
+}
 
 bool addBalance(int64_t& balance, int64_t delta,
                 int64_t maxBalance = std::numeric_limits<int64_t>::max());

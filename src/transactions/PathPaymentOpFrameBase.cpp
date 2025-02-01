@@ -16,9 +16,8 @@ namespace stellar
 {
 
 PathPaymentOpFrameBase::PathPaymentOpFrameBase(Operation const& op,
-                                               OperationResult& res,
-                                               TransactionFrame& parentTx)
-    : OperationFrame(op, res, parentTx)
+                                               TransactionFrame const& parentTx)
+    : OperationFrame(op, parentTx)
 {
 }
 
@@ -46,7 +45,16 @@ PathPaymentOpFrameBase::insertLedgerKeysToPrefetch(
 }
 
 bool
-PathPaymentOpFrameBase::checkIssuer(AbstractLedgerTxn& ltx, Asset const& asset)
+PathPaymentOpFrameBase::isDexOperation() const
+{
+    auto const& src = getSourceAsset();
+    auto const& dest = getDestAsset();
+    return !getPath().empty() || !(src == dest);
+}
+
+bool
+PathPaymentOpFrameBase::checkIssuer(AbstractLedgerTxn& ltx, Asset const& asset,
+                                    OperationResult& res) const
 {
     if (asset.type() != ASSET_TYPE_NATIVE)
     {
@@ -54,7 +62,7 @@ PathPaymentOpFrameBase::checkIssuer(AbstractLedgerTxn& ltx, Asset const& asset)
         if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_13) &&
             !stellar::loadAccountWithoutRecord(ltx, getIssuer(asset)))
         {
-            setResultNoIssuer(asset);
+            setResultNoIssuer(asset, res);
             return false;
         }
     }
@@ -62,13 +70,11 @@ PathPaymentOpFrameBase::checkIssuer(AbstractLedgerTxn& ltx, Asset const& asset)
 }
 
 bool
-PathPaymentOpFrameBase::convert(AbstractLedgerTxn& ltx,
-                                int64_t maxOffersToCross,
-                                Asset const& sendAsset, int64_t maxSend,
-                                int64_t& amountSend, Asset const& recvAsset,
-                                int64_t maxRecv, int64_t& amountRecv,
-                                RoundingType round,
-                                std::vector<ClaimAtom>& offerTrail)
+PathPaymentOpFrameBase::convert(
+    AbstractLedgerTxn& ltx, int64_t maxOffersToCross, Asset const& sendAsset,
+    int64_t maxSend, int64_t& amountSend, Asset const& recvAsset,
+    int64_t maxRecv, int64_t& amountRecv, RoundingType round,
+    std::vector<ClaimAtom>& offerTrail, OperationResult& res) const
 {
     releaseAssertOrThrow(offerTrail.empty());
     releaseAssertOrThrow(!(sendAsset == recvAsset));
@@ -96,7 +102,7 @@ PathPaymentOpFrameBase::convert(AbstractLedgerTxn& ltx,
     switch (r)
     {
     case ConvertResult::eFilterStopCrossSelf:
-        setResultOfferCrossSelf();
+        setResultOfferCrossSelf(res);
         return false;
     case ConvertResult::eOK:
         if (checkTransfer(maxSend, amountSend, maxRecv, amountRecv))
@@ -105,10 +111,10 @@ PathPaymentOpFrameBase::convert(AbstractLedgerTxn& ltx,
         }
     // fall through
     case ConvertResult::ePartial:
-        setResultTooFewOffers();
+        setResultTooFewOffers(res);
         return false;
     case ConvertResult::eCrossedTooMany:
-        mResult.code(opEXCEEDED_WORK_LIMIT);
+        res.code(opEXCEEDED_WORK_LIMIT);
         return false;
     default:
         throw std::runtime_error("unexpected convert result");
@@ -132,9 +138,10 @@ PathPaymentOpFrameBase::shouldBypassIssuerCheck(
 
 bool
 PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
+                                            OperationResult& res,
                                             int64_t amount,
                                             bool bypassIssuerCheck,
-                                            bool doesSourceAccountExist)
+                                            bool doesSourceAccountExist) const
 {
     auto const& asset = getSourceAsset();
 
@@ -148,7 +155,7 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
             sourceAccount = stellar::loadAccount(ltx, getSourceID());
             if (!sourceAccount)
             {
-                setResultMalformed();
+                setResultMalformed(res);
                 return false;
             }
         }
@@ -159,7 +166,7 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
 
         if (amount > getAvailableBalance(header, sourceAccount))
         { // they don't have enough to send
-            setResultUnderfunded();
+            setResultUnderfunded(res);
             return false;
         }
 
@@ -173,7 +180,7 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
     }
     else
     {
-        if (!bypassIssuerCheck && !checkIssuer(ltx, asset))
+        if (!bypassIssuerCheck && !checkIssuer(ltx, asset, res))
         {
             return false;
         }
@@ -181,19 +188,19 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
         auto sourceLine = loadTrustLine(ltx, getSourceID(), asset);
         if (!sourceLine)
         {
-            setResultSourceNoTrust();
+            setResultSourceNoTrust(res);
             return false;
         }
 
         if (!sourceLine.isAuthorized())
         {
-            setResultSourceNotAuthorized();
+            setResultSourceNotAuthorized(res);
             return false;
         }
 
         if (!sourceLine.addBalance(ltx.loadHeader(), -amount))
         {
-            setResultUnderfunded();
+            setResultUnderfunded(res);
             return false;
         }
     }
@@ -204,7 +211,8 @@ PathPaymentOpFrameBase::updateSourceBalance(AbstractLedgerTxn& ltx,
 bool
 PathPaymentOpFrameBase::updateDestBalance(AbstractLedgerTxn& ltx,
                                           int64_t amount,
-                                          bool bypassIssuerCheck)
+                                          bool bypassIssuerCheck,
+                                          OperationResult& res) const
 {
     auto destID = getDestID();
     auto const& asset = getDestAsset();
@@ -218,18 +226,18 @@ PathPaymentOpFrameBase::updateDestBalance(AbstractLedgerTxn& ltx,
                     ltx.loadHeader().current().ledgerVersion,
                     ProtocolVersion::V_11))
             {
-                setResultLineFull();
+                setResultLineFull(res);
             }
             else
             {
-                setResultMalformed();
+                setResultMalformed(res);
             }
             return false;
         }
     }
     else
     {
-        if (!bypassIssuerCheck && !checkIssuer(ltx, asset))
+        if (!bypassIssuerCheck && !checkIssuer(ltx, asset, res))
         {
             return false;
         }
@@ -237,19 +245,19 @@ PathPaymentOpFrameBase::updateDestBalance(AbstractLedgerTxn& ltx,
         auto destLine = stellar::loadTrustLine(ltx, destID, asset);
         if (!destLine)
         {
-            setResultDestNoTrust();
+            setResultDestNoTrust(res);
             return false;
         }
 
         if (!destLine.isAuthorized())
         {
-            setResultDestNotAuthorized();
+            setResultDestNotAuthorized(res);
             return false;
         }
 
         if (!destLine.addBalance(ltx.loadHeader(), amount))
         {
-            setResultLineFull();
+            setResultLineFull(res);
             return false;
         }
     }

@@ -9,20 +9,18 @@
 #include "crypto/Hex.h"
 #include "herder/Herder.h"
 #include "main/Application.h"
-#include "medida/medida.h"
+#include "medida/meter.h"
 #include "overlay/OverlayManager.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/Math.h"
-#include "util/XDROperators.h"
-#include "xdrpp/marshal.h"
 #include <Tracy.hpp>
 
 namespace stellar
 {
 
-static std::chrono::milliseconds const MS_TO_WAIT_FOR_FETCH_REPLY{1500};
-static int const MAX_REBUILD_FETCH_LIST = 10;
+std::chrono::milliseconds const Tracker::MS_TO_WAIT_FOR_FETCH_REPLY{1500};
+int const Tracker::MAX_REBUILD_FETCH_LIST = 10;
 
 Tracker::Tracker(Application& app, Hash const& hash, AskPeer& askPeer)
     : mAskPeer(askPeer)
@@ -52,13 +50,14 @@ Tracker::pop()
 
 // returns false if no one cares about this guy anymore
 bool
-Tracker::clearEnvelopesBelow(uint64 slotIndex)
+Tracker::clearEnvelopesBelow(uint64 slotIndex, uint64 slotToKeep)
 {
     ZoneScoped;
     for (auto iter = mWaitingEnvelopes.begin();
          iter != mWaitingEnvelopes.end();)
     {
-        if (iter->second.statement.slotIndex < slotIndex)
+        if (auto index = iter->second.statement.slotIndex;
+            index < slotIndex && index != slotToKeep)
         {
             iter = mWaitingEnvelopes.erase(iter);
         }
@@ -103,9 +102,12 @@ Tracker::tryNextPeer()
         mLastAskedPeer.reset();
     }
 
+    // canAskPeer is best effort and send happens asynchronously; in the worst
+    // case, we'll place something in the queue that will subsequently be
+    // discarded due to a peer drop.
     auto canAskPeer = [&](Peer::pointer const& p, bool peerHas) {
         auto it = mPeersAsked.find(p);
-        return (p->isAuthenticated() &&
+        return (p->isAuthenticatedAtomic() &&
                 (it == mPeersAsked.end() || (peerHas && !it->second)));
     };
 

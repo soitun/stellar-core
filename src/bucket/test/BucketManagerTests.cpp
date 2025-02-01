@@ -10,11 +10,11 @@
 // first to include <windows.h> -- so we try to include it before everything
 // else.
 #include "util/asio.h"
-#include "bucket/Bucket.h"
 #include "bucket/BucketInputIterator.h"
 #include "bucket/BucketManager.h"
-#include "bucket/BucketManagerImpl.h"
-#include "bucket/BucketTests.h"
+#include "bucket/HotArchiveBucket.h"
+#include "bucket/LiveBucket.h"
+#include "bucket/test/BucketTestUtils.h"
 #include "history/HistoryArchiveManager.h"
 #include "history/test/HistoryTestsUtils.h"
 #include "ledger/LedgerTxn.h"
@@ -22,9 +22,10 @@
 #include "lib/catch.hpp"
 #include "main/Application.h"
 #include "main/Config.h"
-#include "main/ExternalQueue.h"
+#include "main/Maintainer.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
+#include "util/GlobalChecks.h"
 #include "util/Math.h"
 #include "util/Timer.h"
 
@@ -33,98 +34,30 @@
 #include <thread>
 
 using namespace stellar;
-using namespace BucketTests;
+using namespace BucketTestUtils;
 
 namespace BucketManagerTests
 {
 
-class LedgerManagerForBucketTests : public LedgerManagerImpl
-{
-    bool mUseTestEntries{false};
-    std::vector<LedgerEntry> mTestInitEntries;
-    std::vector<LedgerEntry> mTestLiveEntries;
-    std::vector<LedgerKey> mTestDeadEntries;
-
-  protected:
-    void
-    transferLedgerEntriesToBucketList(AbstractLedgerTxn& ltx,
-                                      uint32_t ledgerSeq,
-                                      uint32_t ledgerVers) override
-    {
-        if (mUseTestEntries)
-        {
-            // Seal the ltx but throw its entries away.
-            std::vector<LedgerEntry> init, live;
-            std::vector<LedgerKey> dead;
-            ltx.getAllEntries(init, live, dead);
-            // Use the testing values.
-            mApp.getBucketManager().addBatch(mApp, ledgerSeq, ledgerVers,
-                                             mTestInitEntries, mTestLiveEntries,
-                                             mTestDeadEntries);
-            mUseTestEntries = false;
-        }
-        else
-        {
-            LedgerManagerImpl::transferLedgerEntriesToBucketList(ltx, ledgerSeq,
-                                                                 ledgerVers);
-        }
-    }
-
-  public:
-    void
-    setNextLedgerEntryBatchForBucketTesting(
-        std::vector<LedgerEntry> const& initEntries,
-        std::vector<LedgerEntry> const& liveEntries,
-        std::vector<LedgerKey> const& deadEntries)
-    {
-        mUseTestEntries = true;
-        mTestInitEntries = initEntries;
-        mTestLiveEntries = liveEntries;
-        mTestDeadEntries = deadEntries;
-    }
-
-    LedgerManagerForBucketTests(Application& app) : LedgerManagerImpl(app)
-    {
-    }
-};
-
-class BucketManagerTestApplication : public TestApplication
-{
-  public:
-    BucketManagerTestApplication(VirtualClock& clock, Config const& cfg)
-        : TestApplication(clock, cfg)
-    {
-    }
-
-    virtual LedgerManagerForBucketTests&
-    getLedgerManager() override
-    {
-        auto& lm = ApplicationImpl::getLedgerManager();
-        return static_cast<LedgerManagerForBucketTests&>(lm);
-    }
-
-  private:
-    virtual std::unique_ptr<LedgerManager>
-    createLedgerManager() override
-    {
-        return std::make_unique<LedgerManagerForBucketTests>(*this);
-    }
-};
-
 static void
-clearFutures(Application::pointer app, BucketList& bl)
+clearFutures(Application::pointer app, LiveBucketList& bl)
 {
 
     // First go through the BL and mop up all the FutureBuckets.
-    for (uint32_t i = 0; i < BucketList::kNumLevels; ++i)
+    for (uint32_t i = 0; i < LiveBucketList::kNumLevels; ++i)
     {
         bl.getLevel(i).getNext().clear();
     }
 
     // Then go through all the _worker threads_ and mop up any work they
-    // might still be doing (that might be "dropping a shared_ptr<Bucket>").
+    // might still be doing (that might be "dropping a shared_ptr<BucketBase>").
 
-    size_t n = (size_t)app->getConfig().WORKER_THREADS;
+    size_t n = static_cast<size_t>(app->getConfig().WORKER_THREADS);
+
+    // Background eviction takes up one worker thread.
+    releaseAssert(n != 0);
+    --n;
+
     std::mutex mutex;
     std::condition_variable cv, cv2;
     size_t waiting = 0, finished = 0;
@@ -154,29 +87,6 @@ clearFutures(Application::pointer app, BucketList& bl)
     // Tell the BucketManager to forget all about the futures it knows.
     app->getBucketManager().clearMergeFuturesForTesting();
 }
-
-static Hash
-closeLedger(Application& app, std::optional<SecretKey> skToSignValue,
-            xdr::xvector<UpgradeType, 6> upgrades = emptyUpgradeSteps)
-{
-    auto& lm = app.getLedgerManager();
-    auto lcl = lm.getLastClosedLedgerHeader();
-    uint32_t ledgerNum = lcl.header.ledgerSeq + 1;
-    CLOG_INFO(Bucket, "Artificially closing ledger {} with lcl={}, buckets={}",
-              ledgerNum, hexAbbrev(lcl.hash),
-              hexAbbrev(app.getBucketManager().getBucketList().getHash()));
-    auto txSet = std::make_shared<TxSetFrame const>(lcl.hash);
-    app.getHerder().externalizeValue(txSet, ledgerNum,
-                                     lcl.header.scpValue.closeTime, upgrades,
-                                     skToSignValue);
-    return lm.getLastClosedLedgerHeader().hash;
-}
-
-static Hash
-closeLedger(Application& app)
-{
-    return closeLedger(app, std::nullopt);
-}
 }
 
 using namespace BucketManagerTests;
@@ -187,23 +97,23 @@ TEST_CASE("skip list", "[bucket][bucketmanager]")
     Config const& cfg = getTestConfig();
     Application::pointer app = createTestApplication(clock, cfg);
 
-    class BucketManagerTest : public BucketManagerImpl
+    class BucketManagerTest : public BucketManager
     {
       public:
-        BucketManagerTest(Application& app) : BucketManagerImpl(app)
+        BucketManagerTest(Application& app) : BucketManager(app)
         {
         }
         void
         test()
         {
             Hash h0;
-            Hash h1 = HashUtils::random();
-            Hash h2 = HashUtils::random();
-            Hash h3 = HashUtils::random();
-            Hash h4 = HashUtils::random();
-            Hash h5 = HashUtils::random();
-            Hash h6 = HashUtils::random();
-            Hash h7 = HashUtils::random();
+            Hash h1 = HashUtils::pseudoRandomForTesting();
+            Hash h2 = HashUtils::pseudoRandomForTesting();
+            Hash h3 = HashUtils::pseudoRandomForTesting();
+            Hash h4 = HashUtils::pseudoRandomForTesting();
+            Hash h5 = HashUtils::pseudoRandomForTesting();
+            Hash h6 = HashUtils::pseudoRandomForTesting();
+            Hash h7 = HashUtils::pseudoRandomForTesting();
 
             // up first entry
             LedgerHeader header;
@@ -281,18 +191,23 @@ TEST_CASE_VERSIONS("bucketmanager ownership", "[bucket][bucketmanager]")
 {
     VirtualClock clock;
     Config cfg = getTestConfig();
+
+    // Make sure all Buckets serialize indexes to disk for test
+    cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
     cfg.MANUAL_CLOSE = false;
+
     for_versions_with_differing_bucket_logic(cfg, [&](Config const& cfg) {
         Application::pointer app = createTestApplication(clock, cfg);
 
         std::vector<LedgerEntry> live(
-            LedgerTestUtils::generateValidLedgerEntries(10));
+            LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                {CONFIG_SETTING}, 10));
         std::vector<LedgerKey> dead{};
 
-        std::shared_ptr<Bucket> b1;
+        std::shared_ptr<LiveBucket> b1;
 
         {
-            std::shared_ptr<Bucket> b2 = Bucket::fresh(
+            std::shared_ptr<LiveBucket> b2 = LiveBucket::fresh(
                 app->getBucketManager(), getAppLedgerVersion(app), {}, live,
                 dead, /*countMergeEvents=*/true, clock.getIOContext(),
                 /*doFsync=*/true);
@@ -301,11 +216,11 @@ TEST_CASE_VERSIONS("bucketmanager ownership", "[bucket][bucketmanager]")
             // Bucket is referenced by b1, b2 and the BucketManager.
             CHECK(b1.use_count() == 3);
 
-            std::shared_ptr<Bucket> b3 = Bucket::fresh(
+            std::shared_ptr<LiveBucket> b3 = LiveBucket::fresh(
                 app->getBucketManager(), getAppLedgerVersion(app), {}, live,
                 dead, /*countMergeEvents=*/true, clock.getIOContext(),
                 /*doFsync=*/true);
-            std::shared_ptr<Bucket> b4 = Bucket::fresh(
+            std::shared_ptr<LiveBucket> b4 = LiveBucket::fresh(
                 app->getBucketManager(), getAppLedgerVersion(app), {}, live,
                 dead, /*countMergeEvents=*/true, clock.getIOContext(),
                 /*doFsync=*/true);
@@ -313,56 +228,64 @@ TEST_CASE_VERSIONS("bucketmanager ownership", "[bucket][bucketmanager]")
             CHECK(b1.use_count() == 5);
         }
 
+        // Take pointer by reference to not mess up use_count()
+        auto dropBucket = [&](std::shared_ptr<LiveBucket>& b) {
+            std::string filename = b->getFilename().string();
+            std::string indexFilename =
+                app->getBucketManager().bucketIndexFilename(b->getHash());
+            CHECK(fs::exists(filename));
+            CHECK(fs::exists(indexFilename));
+
+            b.reset();
+            app->getBucketManager().forgetUnreferencedBuckets(
+                app->getLedgerManager().getLastClosedLedgerHAS());
+            CHECK(!fs::exists(filename));
+            CHECK(!fs::exists(indexFilename));
+        };
+
         // Bucket is now only referenced by b1 and the BucketManager.
         CHECK(b1.use_count() == 2);
 
         // Drop bucket ourselves then purge bucketManager.
-        std::string filename = b1->getFilename();
-        CHECK(fs::exists(filename));
-        b1.reset();
-        app->getBucketManager().forgetUnreferencedBuckets();
-        CHECK(!fs::exists(filename));
+        dropBucket(b1);
 
         // Try adding a bucket to the BucketManager's bucketlist
-        auto& bl = app->getBucketManager().getBucketList();
+        auto& bl = app->getBucketManager().getLiveBucketList();
         bl.addBatch(*app, 1, getAppLedgerVersion(app), {}, live, dead);
         clearFutures(app, bl);
         b1 = bl.getLevel(0).getCurr();
 
-        // Bucket should be referenced by bucketlist itself, BucketManager cache
-        // and b1.
+        // Bucket should be referenced by bucketlist itself, BucketManager
+        // cache and b1.
         CHECK(b1.use_count() == 3);
 
-        // This shouldn't change if we forget unreferenced buckets since it's
-        // referenced by bucketlist.
-        app->getBucketManager().forgetUnreferencedBuckets();
+        // This shouldn't change if we forget unreferenced buckets since
+        // it's referenced by bucketlist.
+        app->getBucketManager().forgetUnreferencedBuckets(
+            app->getLedgerManager().getLastClosedLedgerHAS());
         CHECK(b1.use_count() == 3);
 
         // But if we mutate the curr bucket of the bucketlist, it should.
-        live[0] = LedgerTestUtils::generateValidLedgerEntry(10);
+        live[0] = LedgerTestUtils::generateValidLedgerEntryWithExclusions(
+            {CONFIG_SETTING});
         bl.addBatch(*app, 1, getAppLedgerVersion(app), {}, live, dead);
         clearFutures(app, bl);
         CHECK(b1.use_count() == 2);
 
         // Drop it again.
-        filename = b1->getFilename();
-        CHECK(fs::exists(filename));
-        b1.reset();
-        app->getBucketManager().forgetUnreferencedBuckets();
-        CHECK(!fs::exists(filename));
+        dropBucket(b1);
     });
 }
 
 TEST_CASE("bucketmanager missing buckets fail", "[bucket][bucketmanager]")
 {
-    Config cfg(getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE));
+    Config cfg(getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT));
     std::string someBucketFileName;
     {
         VirtualClock clock;
-        auto app =
-            createTestApplication<BucketManagerTestApplication>(clock, cfg);
+        auto app = createTestApplication<BucketTestApplication>(clock, cfg);
         BucketManager& bm = app->getBucketManager();
-        BucketList& bl = bm.getBucketList();
+        LiveBucketList& bl = bm.getLiveBucketList();
         LedgerManagerForBucketTests& lm = app->getLedgerManager();
 
         uint32_t ledger = 0;
@@ -371,11 +294,14 @@ TEST_CASE("bucketmanager missing buckets fail", "[bucket][bucketmanager]")
         {
             ++ledger;
             lm.setNextLedgerEntryBatchForBucketTesting(
-                {}, LedgerTestUtils::generateValidLedgerEntries(10), {});
+                {},
+                LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                    {CONFIG_SETTING}, 10),
+                {});
             closeLedger(*app);
-        } while (!BucketList::levelShouldSpill(ledger, level - 1));
+        } while (!LiveBucketList::levelShouldSpill(ledger, level - 1));
         auto someBucket = bl.getLevel(1).getCurr();
-        someBucketFileName = someBucket->getFilename();
+        someBucketFileName = someBucket->getFilename().string();
     }
 
     // Delete a bucket from the bucket dir
@@ -394,7 +320,7 @@ TEST_CASE_VERSIONS("bucketmanager reattach to finished merge",
                    "[bucket][bucketmanager]")
 {
     VirtualClock clock;
-    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    Config cfg(getTestConfig());
     cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
     cfg.MANUAL_CLOSE = false;
 
@@ -402,7 +328,7 @@ TEST_CASE_VERSIONS("bucketmanager reattach to finished merge",
         Application::pointer app = createTestApplication(clock, cfg);
 
         BucketManager& bm = app->getBucketManager();
-        BucketList& bl = bm.getBucketList();
+        LiveBucketList& bl = bm.getLiveBucketList();
         auto vers = getAppLedgerVersion(app);
 
         // Add some entries to get to a nontrivial merge-state.
@@ -411,10 +337,17 @@ TEST_CASE_VERSIONS("bucketmanager reattach to finished merge",
         do
         {
             ++ledger;
-            bl.addBatch(*app, ledger, vers, {},
-                        LedgerTestUtils::generateValidLedgerEntries(10), {});
-            bm.forgetUnreferencedBuckets();
-        } while (!BucketList::levelShouldSpill(ledger, level - 1));
+            auto lh =
+                app->getLedgerManager().getLastClosedLedgerHeader().header;
+            lh.ledgerSeq = ledger;
+            addLiveBatchAndUpdateSnapshot(
+                *app, lh, {},
+                LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
+                    {CONFIG_SETTING}, 10),
+                {});
+            bm.forgetUnreferencedBuckets(
+                app->getLedgerManager().getLastClosedLedgerHAS());
+        } while (!LiveBucketList::levelShouldSpill(ledger, level - 1));
 
         // Check that the merge on level isn't committed (we're in
         // ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING mode that does not resolve
@@ -439,7 +372,7 @@ TEST_CASE_VERSIONS("bucketmanager reattach to finished merge",
 
         // Reattach to _finished_ merge future on level.
         has2.currentBuckets[level].next.makeLive(
-            *app, vers, BucketList::keepDeadEntries(level));
+            *app, vers, LiveBucketList::keepTombstoneEntries(level));
         REQUIRE(has2.currentBuckets[level].next.isMerging());
 
         // Resolve reattached future.
@@ -455,7 +388,7 @@ TEST_CASE_VERSIONS("bucketmanager reattach to running merge",
                    "[bucket][bucketmanager]")
 {
     VirtualClock clock;
-    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    Config cfg(getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT));
     cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
     cfg.MANUAL_CLOSE = false;
 
@@ -463,7 +396,7 @@ TEST_CASE_VERSIONS("bucketmanager reattach to running merge",
         Application::pointer app = createTestApplication(clock, cfg);
 
         BucketManager& bm = app->getBucketManager();
-        BucketList& bl = bm.getBucketList();
+        LiveBucketList& bl = bm.getLiveBucketList();
         auto vers = getAppLedgerVersion(app);
 
         // This test is a race that will (if all goes well) eventually be won:
@@ -494,10 +427,17 @@ TEST_CASE_VERSIONS("bucketmanager reattach to running merge",
             // Merges will start on one or more levels here, starting a race
             // between the main thread here and the background workers doing
             // the merges.
-            bl.addBatch(*app, ledger, vers, {},
-                        LedgerTestUtils::generateValidLedgerEntries(100), {});
+            auto lh =
+                app->getLedgerManager().getLastClosedLedgerHeader().header;
+            lh.ledgerSeq = ledger;
+            addLiveBatchAndUpdateSnapshot(
+                *app, lh, {},
+                LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                    {CONFIG_SETTING}, 100),
+                {});
 
-            bm.forgetUnreferencedBuckets();
+            bm.forgetUnreferencedBuckets(
+                app->getLedgerManager().getLastClosedLedgerHAS());
 
             HistoryArchiveState has(ledger, bl,
                                     app->getConfig().NETWORK_PASSPHRASE);
@@ -510,12 +450,14 @@ TEST_CASE_VERSIONS("bucketmanager reattach to running merge",
             // win quite shortly).
             HistoryArchiveState has2;
             has2.fromString(serialHas);
-            for (uint32_t level = 0; level < BucketList::kNumLevels; ++level)
+            for (uint32_t level = 0; level < LiveBucketList::kNumLevels;
+                 ++level)
             {
                 if (has2.currentBuckets[level].next.hasHashes())
                 {
                     has2.currentBuckets[level].next.makeLive(
-                        *app, vers, BucketList::keepDeadEntries(level));
+                        *app, vers,
+                        LiveBucketList::keepTombstoneEntries(level));
                 }
             }
         }
@@ -533,19 +475,20 @@ TEST_CASE("bucketmanager do not leak empty-merge futures",
     // The point of this test is to confirm that
     // BucketManager::noteEmptyMergeOutput is being called properly from merges
     // that produce empty outputs, and that the input buckets to those merges
-    // are thereby not leaking.
+    // are thereby not leaking. Disable BucketListDB so that snapshots do not
+    // hold persist buckets, complicating bucket counting.
     VirtualClock clock;
-    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY));
     cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
     cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
         static_cast<uint32_t>(
-            Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
+            LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
         1;
 
-    auto app = createTestApplication<BucketManagerTestApplication>(clock, cfg);
+    auto app = createTestApplication<BucketTestApplication>(clock, cfg);
 
     BucketManager& bm = app->getBucketManager();
-    BucketList& bl = bm.getBucketList();
+    LiveBucketList& bl = bm.getLiveBucketList();
     LedgerManagerForBucketTests& lm = app->getLedgerManager();
 
     // We create 8 live ledger entries spread across 8 ledgers then add a ledger
@@ -553,7 +496,9 @@ TEST_CASE("bucketmanager do not leak empty-merge futures",
     // subsequent merges touch them, producing empty buckets.
     for (size_t i = 0; i < 128; ++i)
     {
-        auto entries = LedgerTestUtils::generateValidLedgerEntries(8);
+        auto entries =
+            LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
+                {CONFIG_SETTING}, 8);
         REQUIRE(entries.size() == 8);
         for (auto const& e : entries)
         {
@@ -576,8 +521,10 @@ TEST_CASE("bucketmanager do not leak empty-merge futures",
         bl.resolveAnyReadyFutures();
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    bm.forgetUnreferencedBuckets();
-    auto bmRefBuckets = bm.getReferencedBuckets();
+    bm.forgetUnreferencedBuckets(
+        app->getLedgerManager().getLastClosedLedgerHAS());
+    auto bmRefBuckets = bm.getAllReferencedBuckets(
+        app->getLedgerManager().getLastClosedLedgerHAS());
     auto bmDirBuckets = bm.getBucketHashesInBucketDirForTesting();
 
     // Remove the 0 bucket in case it's "referenced"; it's never a file.
@@ -612,8 +559,6 @@ TEST_CASE_VERSIONS(
         auto vers = getAppLedgerVersion(app);
         auto& hm = app->getHistoryManager();
         auto& bm = app->getBucketManager();
-        auto& bl = bm.getBucketList();
-        auto& lm = app->getLedgerManager();
         hm.setPublicationEnabled(false);
         app->getHistoryArchiveManager().initializeHistoryArchive(
             tcfg.getArchiveDirName());
@@ -626,19 +571,27 @@ TEST_CASE_VERSIONS(
             auto ra = bm.readMergeCounters().mFinishedMergeReattachments;
             CLOG_INFO(Bucket, "finished-merge reattachments while queueing: {}",
                       ra);
-            bl.addBatch(*app, lm.getLastClosedLedgerNum() + 1, vers, {},
-                        LedgerTestUtils::generateValidLedgerEntries(100), {});
+            auto lh =
+                app->getLedgerManager().getLastClosedLedgerHeader().header;
+            lh.ledgerSeq++;
+            addLiveBatchAndUpdateSnapshot(
+                *app, lh, {},
+                LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                    {CONFIG_SETTING}, 100),
+                {});
             clock.crank(false);
-            bm.forgetUnreferencedBuckets();
+            bm.forgetUnreferencedBuckets(
+                app->getLedgerManager().getLastClosedLedgerHAS());
         }
         // We should have published nothing and have the first
         // checkpoint still queued.
         REQUIRE(hm.getPublishSuccessCount() == 0);
-        REQUIRE(hm.getMinLedgerQueuedToPublish() == 7);
+        REQUIRE(HistoryManager::getMinLedgerQueuedToPublish(app->getConfig()) ==
+                7);
 
         auto oldReattachments =
             bm.readMergeCounters().mFinishedMergeReattachments;
-        auto HASs = hm.getPublishQueueStates();
+        auto HASs = HistoryManager::getPublishQueueStates(app->getConfig());
         REQUIRE(HASs.size() == 5);
         for (auto& has : HASs)
         {
@@ -647,7 +600,7 @@ TEST_CASE_VERSIONS(
 
         auto ra = bm.readMergeCounters().mFinishedMergeReattachments;
         if (protocolVersionIsBefore(vers,
-                                    Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+                                    LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
         {
             // Versions prior to FIRST_PROTOCOL_SHADOWS_REMOVED re-attach to
             // finished merges
@@ -669,8 +622,7 @@ TEST_CASE_VERSIONS(
             clock.crank(false);
 
             // Trim history after publishing whenever possible.
-            ExternalQueue ps(*app);
-            ps.deleteOldEntries(50000);
+            app->getMaintainer().performMaintenance(50000);
         }
     });
 }
@@ -710,9 +662,9 @@ TEST_CASE_VERSIONS(
 class StopAndRestartBucketMergesTest
 {
     static void
-    resolveAllMerges(BucketList& bl)
+    resolveAllMerges(LiveBucketList& bl)
     {
-        for (uint32 i = 0; i < BucketList::kNumLevels; ++i)
+        for (uint32 i = 0; i < LiveBucketList::kNumLevels; ++i)
         {
             auto& level = bl.getLevel(i);
             auto& next = level.getNext();
@@ -798,8 +750,8 @@ class StopAndRestartBucketMergesTest
         checkSensiblePostInitEntryMergeCounters(uint32_t protocol) const
         {
             CHECK(mMergeCounters.mPostInitEntryProtocolMerges != 0);
-            if (protocolVersionIsBefore(protocol,
-                                        Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+            if (protocolVersionIsBefore(
+                    protocol, LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
             {
                 CHECK(mMergeCounters.mPostShadowRemovalProtocolMerges == 0);
             }
@@ -825,8 +777,8 @@ class StopAndRestartBucketMergesTest
             CHECK(mMergeCounters.mOldInitEntriesMergedWithNewDead != 0);
             CHECK(mMergeCounters.mNewEntriesMergedWithOldNeitherInit != 0);
 
-            if (protocolVersionIsBefore(protocol,
-                                        Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+            if (protocolVersionIsBefore(
+                    protocol, LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
             {
                 CHECK(mMergeCounters.mShadowScanSteps != 0);
                 CHECK(mMergeCounters.mLiveEntryShadowElisions != 0);
@@ -961,14 +913,14 @@ class StopAndRestartBucketMergesTest
         {
             LedgerManager& lm = app.getLedgerManager();
             BucketManager& bm = app.getBucketManager();
-            BucketList& bl = bm.getBucketList();
+            LiveBucketList& bl = bm.getLiveBucketList();
             // Complete those merges we're about to inspect.
             resolveAllMerges(bl);
 
             mMergeCounters = bm.readMergeCounters();
             mLedgerHeaderHash = lm.getLastClosedLedgerHeader().hash;
             mBucketListHash = bl.getHash();
-            BucketLevel& blv = bl.getLevel(level);
+            BucketLevel<LiveBucket>& blv = bl.getLevel(level);
             mCurrBucketHash = blv.getCurr()->getHash();
             mSnapBucketHash = blv.getSnap()->getHash();
         }
@@ -987,13 +939,13 @@ class StopAndRestartBucketMergesTest
     collectLedgerEntries(Application& app,
                          std::map<LedgerKey, LedgerEntry>& entries)
     {
-        auto bl = app.getBucketManager().getBucketList();
-        for (uint32_t i = BucketList::kNumLevels; i > 0; --i)
+        auto bl = app.getBucketManager().getLiveBucketList();
+        for (uint32_t i = LiveBucketList::kNumLevels; i > 0; --i)
         {
-            BucketLevel const& level = bl.getLevel(i - 1);
+            BucketLevel<LiveBucket> const& level = bl.getLevel(i - 1);
             for (auto bucket : {level.getSnap(), level.getCurr()})
             {
-                for (BucketInputIterator bi(bucket); bi; ++bi)
+                for (LiveBucketInputIterator bi(bucket); bi; ++bi)
                 {
                     BucketEntry const& e = *bi;
                     if (e.type() == LIVEENTRY || e.type() == INITENTRY)
@@ -1036,10 +988,11 @@ class StopAndRestartBucketMergesTest
     void
     calculateDesignatedLedgers()
     {
-        uint32_t spillFreq = BucketList::levelHalf(mDesignatedLevel);
-        uint32_t prepFreq = (mDesignatedLevel == 0
-                                 ? 1
-                                 : BucketList::levelHalf(mDesignatedLevel - 1));
+        uint32_t spillFreq = LiveBucketList::levelHalf(mDesignatedLevel);
+        uint32_t prepFreq =
+            (mDesignatedLevel == 0
+                 ? 1
+                 : LiveBucketList::levelHalf(mDesignatedLevel - 1));
 
         uint32_t const SPILLCOUNT = 5;
         uint32_t const PREPCOUNT = 5;
@@ -1103,7 +1056,7 @@ class StopAndRestartBucketMergesTest
     collectControlSurveys()
     {
         VirtualClock clock;
-        Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+        Config cfg(getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT));
         cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
         cfg.ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING = true;
         cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = mProtocol;
@@ -1112,8 +1065,7 @@ class StopAndRestartBucketMergesTest
         CLOG_INFO(Bucket,
                   "Collecting control surveys in ledger range 2..{} = {:#x}",
                   finalLedger, finalLedger);
-        auto app =
-            createTestApplication<BucketManagerTestApplication>(clock, cfg);
+        auto app = createTestApplication<BucketTestApplication>(clock, cfg);
 
         std::vector<LedgerKey> allKeys;
         std::map<LedgerKey, LedgerEntry> currLive;
@@ -1182,7 +1134,8 @@ class StopAndRestartBucketMergesTest
             auto nInits =
                 nEntriesInBatch - (liveEntries.size() + deadEntries.size());
             auto newRandom =
-                LedgerTestUtils::generateValidLedgerEntries(nInits);
+                LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
+                    {CONFIG_SETTING}, nInits);
             for (auto const& e : newRandom)
             {
                 auto k = LedgerEntryKey(e);
@@ -1214,10 +1167,11 @@ class StopAndRestartBucketMergesTest
     runStopAndRestartTest(uint32_t firstProtocol, uint32_t secondProtocol)
     {
         std::unique_ptr<VirtualClock> clock = std::make_unique<VirtualClock>();
-        Config cfg(getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE));
+        Config cfg(getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT));
         cfg.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
         cfg.ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING = true;
         cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = firstProtocol;
+        cfg.INVARIANT_CHECKS = {};
         assert(!mDesignatedLedgers.empty());
         uint32_t finalLedger = (*mDesignatedLedgers.rbegin()) + 1;
         uint32_t currProtocol = firstProtocol;
@@ -1230,8 +1184,7 @@ class StopAndRestartBucketMergesTest
         uint32_t protocolSwitchLedger = *(std::next(
             mDesignatedLedgers.begin(), mDesignatedLedgers.size() / 2));
 
-        auto app =
-            createTestApplication<BucketManagerTestApplication>(*clock, cfg);
+        auto app = createTestApplication<BucketTestApplication>(*clock, cfg);
         uint32_t finalLedger2 = finalLedger;
         CLOG_INFO(Bucket,
                   "Running stop/restart test in ledger range 2..{} = {:#x}",
@@ -1243,7 +1196,7 @@ class StopAndRestartBucketMergesTest
             lm.setNextLedgerEntryBatchForBucketTesting(
                 mInitEntryBatches[i - 2], mLiveEntryBatches[i - 2],
                 mDeadEntryBatches[i - 2]);
-            resolveAllMerges(app->getBucketManager().getBucketList());
+            resolveAllMerges(app->getBucketManager().getLiveBucketList());
             auto countersBeforeClose =
                 app->getBucketManager().readMergeCounters();
 
@@ -1271,13 +1224,15 @@ class StopAndRestartBucketMergesTest
             auto j = mControlSurveys.find(i);
             if (j != mControlSurveys.end())
             {
-                if (BucketList::levelShouldSpill(i, mDesignatedLevel - 1))
+                if (LiveBucketList::levelShouldSpill(i, mDesignatedLevel - 1))
                 {
                     // Confirm that there's a merge-in-progress at this level
                     // (closing ledger i should have provoked a spill from
                     // mDesignatedLevel-1 to mDesignatedLevel)
-                    BucketList& bl = app->getBucketManager().getBucketList();
-                    BucketLevel& blv = bl.getLevel(mDesignatedLevel);
+                    LiveBucketList& bl =
+                        app->getBucketManager().getLiveBucketList();
+                    BucketLevel<LiveBucket>& blv =
+                        bl.getLevel(mDesignatedLevel);
                     REQUIRE(blv.getNext().isMerging());
                 }
 
@@ -1303,13 +1258,15 @@ class StopAndRestartBucketMergesTest
                 // Restart the application.
                 CLOG_INFO(Bucket, "Restarting application at ledger {}", i);
                 clock = std::make_unique<VirtualClock>();
-                app = createTestApplication<BucketManagerTestApplication>(
-                    *clock, cfg, false);
-                if (BucketList::levelShouldSpill(i, mDesignatedLevel - 1))
+                app = createTestApplication<BucketTestApplication>(*clock, cfg,
+                                                                   false);
+                if (LiveBucketList::levelShouldSpill(i, mDesignatedLevel - 1))
                 {
                     // Confirm that the merge-in-progress was restarted.
-                    BucketList& bl = app->getBucketManager().getBucketList();
-                    BucketLevel& blv = bl.getLevel(mDesignatedLevel);
+                    LiveBucketList& bl =
+                        app->getBucketManager().getLiveBucketList();
+                    BucketLevel<LiveBucket>& blv =
+                        bl.getLevel(mDesignatedLevel);
                     REQUIRE(blv.getNext().isMerging());
                 }
 
@@ -1343,7 +1300,7 @@ class StopAndRestartBucketMergesTest
         assert(!mControlSurveys.empty());
         if (protocolVersionStartsFrom(
                 mProtocol,
-                Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY))
+                LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY))
         {
             mControlSurveys.rbegin()->second.dumpMergeCounters(
                 "control, Post-INITENTRY", mDesignatedLevel);
@@ -1367,11 +1324,11 @@ TEST_CASE("bucket persistence over app restart with initentry",
 {
     for (uint32_t protocol :
          {static_cast<uint32_t>(
-              Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
+              LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
               1,
           static_cast<uint32_t>(
-              Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY),
-          static_cast<uint32_t>(Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)})
+              LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY),
+          static_cast<uint32_t>(LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED)})
     {
         for (uint32_t level : {2, 3})
         {
@@ -1387,11 +1344,11 @@ TEST_CASE("bucket persistence over app restart with initentry - extended",
 {
     for (uint32_t protocol :
          {static_cast<uint32_t>(
-              Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
+              LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
               1,
           static_cast<uint32_t>(
-              Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY),
-          static_cast<uint32_t>(Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)})
+              LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY),
+          static_cast<uint32_t>(LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED)})
     {
         for (uint32_t level : {2, 3, 4, 5})
         {
@@ -1407,19 +1364,24 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
     std::vector<stellar::LedgerKey> emptySet;
     std::vector<stellar::LedgerEntry> emptySetEntry;
 
-    Config cfg0(getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE));
+    Config cfg0(getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT));
     cfg0.MANUAL_CLOSE = false;
 
     for_versions_with_differing_bucket_logic(cfg0, [&](Config const& cfg0) {
-        Config cfg1(getTestConfig(1, Config::TESTDB_ON_DISK_SQLITE));
+        Config cfg1(getTestConfig(1, Config::TESTDB_BUCKET_DB_PERSISTENT));
         cfg1.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
             cfg0.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION;
         cfg1.ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = true;
 
+        auto batch_entries =
+            LedgerTestUtils::generateValidUniqueLedgerEntriesWithExclusions(
+                {CONFIG_SETTING, OFFER}, 111);
+        auto alice = batch_entries.back();
+        batch_entries.pop_back();
         std::vector<std::vector<LedgerEntry>> batches;
-        for (uint32_t i = 0; i < 110; ++i)
+        for (auto const& batch_entry : batch_entries)
         {
-            batches.push_back(LedgerTestUtils::generateValidLedgerEntries(1));
+            batches.emplace_back().push_back(batch_entry);
         }
 
         // Inject a common object at the first batch we're going to run
@@ -1427,7 +1389,6 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
         // pause-merge (#64, where we stop and serialize) sensitive to
         // shadowing, and requires shadows be reconstituted when the merge
         // is restarted.
-        auto alice = LedgerTestUtils::generateValidLedgerEntry(1);
         uint32_t pause = 65;
         batches[2].push_back(alice);
         batches[pause - 2].push_back(alice);
@@ -1442,7 +1403,7 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
             VirtualClock clock;
             Application::pointer app = createTestApplication(clock, cfg0);
             sk = std::make_optional<SecretKey>(cfg0.NODE_SEED);
-            BucketList& bl = app->getBucketManager().getBucketList();
+            LiveBucketList& bl = app->getBucketManager().getLiveBucketList();
 
             uint32_t i = 2;
             while (i < pause)
@@ -1477,7 +1438,7 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
         {
             VirtualClock clock;
             Application::pointer app = createTestApplication(clock, cfg1);
-            BucketList& bl = app->getBucketManager().getBucketList();
+            LiveBucketList& bl = app->getBucketManager().getLiveBucketList();
 
             uint32_t i = 2;
             while (i < pause)
@@ -1504,7 +1465,7 @@ TEST_CASE_VERSIONS("bucket persistence over app restart",
             VirtualClock clock;
             Application::pointer app = Application::create(clock, cfg1, false);
             app->start();
-            BucketList& bl = app->getBucketManager().getBucketList();
+            LiveBucketList& bl = app->getBucketManager().getLiveBucketList();
 
             // Confirm that we re-acquired the close-ledger state.
             REQUIRE(

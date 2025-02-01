@@ -9,13 +9,12 @@
 #include "PeerDoor.h"
 #include "PeerManager.h"
 #include "herder/TxSetFrame.h"
+#include "ledger/LedgerTxn.h"
 #include "overlay/Floodgate.h"
-#include "overlay/ItemFetcher.h"
 #include "overlay/OverlayManager.h"
 #include "overlay/OverlayMetrics.h"
-#include "overlay/StellarXDR.h"
 #include "overlay/SurveyManager.h"
-#include "util/Logging.h"
+#include "overlay/TxDemandsManager.h"
 #include "util/Timer.h"
 
 #include "medida/metrics_registry.h"
@@ -49,7 +48,8 @@ class OverlayManagerImpl : public OverlayManager
                            medida::MetricsRegistry& metricsRegistry,
                            std::string const& directionString,
                            std::string const& cancelledName,
-                           int maxAuthenticatedCount);
+                           int maxAuthenticatedCount,
+                           std::shared_ptr<SurveyManager> sm);
 
         medida::Meter& mConnectionsAttempted;
         medida::Meter& mConnectionsEstablished;
@@ -59,9 +59,14 @@ class OverlayManagerImpl : public OverlayManager
         OverlayManagerImpl& mOverlayManager;
         std::string mDirectionString;
         size_t mMaxAuthenticatedCount;
+        std::shared_ptr<SurveyManager> mSurveyManager;
 
         std::vector<Peer::pointer> mPending;
         std::map<NodeID, Peer::pointer> mAuthenticated;
+        // Keep dropped peers alive, just so overlay thread can still
+        // safely perform delayed shutdown, etc; when overlay thread is done and
+        // main is the only user left, release all references
+        std::unordered_set<Peer::pointer> mDropped;
 
         Peer::pointer byAddress(PeerBareAddress const& address) const;
         void removePeer(Peer* peer);
@@ -70,15 +75,14 @@ class OverlayManagerImpl : public OverlayManager
         void shutdown();
     };
 
-    PeersList mInboundPeers;
-    PeersList mOutboundPeers;
+    std::shared_ptr<int> mLiveInboundPeersCounter;
 
     PeersList& getPeersList(Peer* peer);
 
     PeerManager mPeerManager;
     PeerDoor mDoor;
     PeerAuth mAuth;
-    bool mShuttingDown;
+    std::atomic<bool> mShuttingDown;
 
     OverlayMetrics mOverlayMetrics;
 
@@ -86,14 +90,22 @@ class OverlayManagerImpl : public OverlayManager
     RandomEvictionCache<uint64_t, bool> mMessageCache;
 
     void tick();
+    void updateTimerAndMaybeDropRandomPeer(bool shouldDrop);
     VirtualTimer mTimer;
     VirtualTimer mPeerIPTimer;
+    std::optional<VirtualClock::time_point> mLastOutOfSyncReconnect;
 
     friend class OverlayManagerTests;
+    friend class Simulation;
 
     Floodgate mFloodGate;
+    TxDemandsManager mTxDemandsManager;
 
     std::shared_ptr<SurveyManager> mSurveyManager;
+
+    PeersList mInboundPeers;
+    PeersList mOutboundPeers;
+    int availableOutboundPendingSlots() const;
 
   public:
     OverlayManagerImpl(Application& app);
@@ -101,13 +113,17 @@ class OverlayManagerImpl : public OverlayManager
 
     void clearLedgersBelow(uint32_t ledgerSeq, uint32_t lclSeq) override;
     bool recvFloodedMsgID(StellarMessage const& msg, Peer::pointer peer,
-                          Hash& msgID) override;
+                          Hash const& msgID) override;
+    void recvTransaction(StellarMessage const& msg, Peer::pointer peer,
+                         Hash const& index) override;
     void forgetFloodedMsg(Hash const& msgID) override;
-    bool broadcastMessage(StellarMessage const& msg,
-                          bool force = false) override;
+    void recvTxDemand(FloodDemand const& dmd, Peer::pointer peer) override;
+    bool broadcastMessage(std::shared_ptr<StellarMessage const> msg,
+                          std::optional<Hash> const hash = std::nullopt,
+                          uint32_t minOverlayVersion = 0) override;
     void connectTo(PeerBareAddress const& address) override;
 
-    void addInboundConnection(Peer::pointer peer) override;
+    void maybeAddInboundConnection(Peer::pointer peer) override;
     bool addOutboundConnection(Peer::pointer peer) override;
     void removePeer(Peer* peer) override;
     void storeConfigPeers();
@@ -115,10 +131,12 @@ class OverlayManagerImpl : public OverlayManager
 
     bool acceptAuthenticatedPeer(Peer::pointer peer) override;
     bool isPreferred(Peer* peer) const override;
-    bool isFloodMessage(StellarMessage const& msg) override;
     std::vector<Peer::pointer> const& getInboundPendingPeers() const override;
     std::vector<Peer::pointer> const& getOutboundPendingPeers() const override;
     std::vector<Peer::pointer> getPendingPeers() const override;
+
+    virtual std::shared_ptr<int> getLiveInboundPeersCounter() const override;
+
     int getPendingPeersCount() const override;
     std::map<NodeID, Peer::pointer> const&
     getInboundAuthenticatedPeers() const override;
@@ -126,7 +144,6 @@ class OverlayManagerImpl : public OverlayManager
     getOutboundAuthenticatedPeers() const override;
     std::map<NodeID, Peer::pointer> getAuthenticatedPeers() const override;
     int getAuthenticatedPeersCount() const override;
-    int64_t getFlowControlPercentage() const override;
 
     // returns nullptr if the passed peer isn't found
     Peer::pointer getConnectedPeer(PeerBareAddress const& address) override;
@@ -152,9 +169,6 @@ class OverlayManagerImpl : public OverlayManager
     void recordMessageMetric(StellarMessage const& stellarMsg,
                              Peer::pointer peer) override;
 
-    void updateFloodRecord(StellarMessage const& oldMsg,
-                           StellarMessage const& newMsg) override;
-
   private:
     struct ResolvedPeers
     {
@@ -167,6 +181,8 @@ class OverlayManagerImpl : public OverlayManager
     std::future<ResolvedPeers> mResolvedPeers;
     bool mResolvingPeersWithBackoff;
     int mResolvingPeersRetryCount;
+    RandomEvictionCache<Hash, std::weak_ptr<CapacityTrackedMessage>>
+        mScheduledMessages;
 
     void triggerPeerResolution();
     std::pair<std::vector<PeerBareAddress>, bool>
@@ -184,16 +200,24 @@ class OverlayManagerImpl : public OverlayManager
 
     bool moveToAuthenticated(Peer::pointer peer);
 
-    int availableOutboundPendingSlots() const;
     int availableOutboundAuthenticatedSlots() const;
     int nonPreferredAuthenticatedCount() const;
 
-    bool isPossiblyPreferred(std::string const& ip);
+    virtual bool isPossiblyPreferred(std::string const& ip) const override;
+    virtual bool haveSpaceForConnection(std::string const& ip) const override;
 
     void updateSizeCounters();
 
     void extractPeersFromMap(std::map<NodeID, Peer::pointer> const& peerMap,
                              std::vector<Peer::pointer>& result);
     void shufflePeerList(std::vector<Peer::pointer>& peerList);
+    uint32_t getFlowControlBytesTotal() const override;
+
+    // Returns `true` iff the overlay can accept the outbound peer at `address`.
+    // Logs whenever a peer cannot be accepted.
+    bool canAcceptOutboundPeer(PeerBareAddress const& address) const;
+
+    bool checkScheduledAndCache(
+        std::shared_ptr<CapacityTrackedMessage> tracker) override;
 };
 }

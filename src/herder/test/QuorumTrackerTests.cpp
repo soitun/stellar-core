@@ -17,7 +17,7 @@ using namespace stellar;
 void
 testQuorumTracker()
 {
-    Config cfg(getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE));
+    Config cfg(getTestConfig(0, Config::TESTDB_BUCKET_DB_PERSISTENT));
     cfg.MANUAL_CLOSE = false;
 
     std::vector<SecretKey> otherKeys;
@@ -56,7 +56,7 @@ testQuorumTracker()
     struct ValuesTxSet
     {
         Value mSignedV;
-        TxSetFrameConstPtr mTxSet;
+        TxSetXDRFrameConstPtr mTxSet;
     };
 
     auto recvEnvelope = [&](SCPEnvelope envelope, uint64 slotID,
@@ -73,7 +73,7 @@ testQuorumTracker()
         herder->recvSCPQuorumSet(qSetH, qSet);
         for (auto& p : pp)
         {
-            herder->recvTxSet(p.mTxSet->getContentsHash(), *p.mTxSet);
+            herder->recvTxSet(p.mTxSet->getContentsHash(), p.mTxSet);
         }
     };
     auto recvNom = [&](uint64 slotID, SecretKey const& k,
@@ -109,7 +109,7 @@ testQuorumTracker()
     };
     auto makeValue = [&](int i) {
         auto const& lcl = app->getLedgerManager().getLastClosedLedgerHeader();
-        auto txSet = std::make_shared<TxSetFrame const>(lcl.hash);
+        auto txSet = TxSetXDRFrame::makeEmpty(lcl);
         StellarValue sv = herder->makeStellarValue(
             txSet->getContentsHash(), lcl.header.scpValue.closeTime + i,
             emptyUpgradeSteps, valSigner);
@@ -185,7 +185,7 @@ TEST_CASE("quorum tracker", "[quorum][herder]")
 
 TEST_CASE("quorum tracker closest validators", "[quorum][herder]")
 {
-    Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_SQLITE));
+    Config cfg(getTestConfig(0, Config::TESTDB_DEFAULT));
 
     std::vector<PublicKey> otherKeys;
     int const kKeysCount = 7;

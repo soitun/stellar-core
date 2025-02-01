@@ -2,10 +2,10 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "TestTxSetUtils.h"
 #include "crypto/SHA.h"
 #include "herder/HerderImpl.h"
 #include "herder/PendingEnvelopes.h"
+#include "herder/test/TestTxSetUtils.h"
 #include "lib/catch.hpp"
 #include "main/Application.h"
 #include "test/TestAccount.h"
@@ -20,7 +20,7 @@ using namespace stellar::txtest;
 
 TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
 {
-    Config cfg(getTestConfig(0, Config::TESTDB_DEFAULT));
+    Config cfg(getTestConfig());
     cfg.MANUAL_CLOSE = false;
 
     VirtualClock clock;
@@ -30,14 +30,20 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
     cfg.QUORUM_SET.validators.emplace_back(s.getPublicKey());
     Application::pointer app = createTestApplication(clock, cfg);
 
-    auto const& lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+    auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
 
     auto& herder = static_cast<HerderImpl&>(app->getHerder());
 
     auto root = TestAccount::createRoot(*app);
-    auto a1 = TestAccount{*app, getAccount("A")};
-    using TxPair = std::pair<Value, TxSetFrameConstPtr>;
-    auto makeTxPair = [&](TxSetFrameConstPtr txSet, uint64_t closeTime,
+    size_t numAccounts = 50;
+    std::vector<TestAccount> accs;
+    for (size_t i = 0; i < numAccounts; i++)
+    {
+        accs.push_back(TestAccount{*app, getAccount("A" + std::to_string(i))});
+    }
+
+    using TxPair = std::pair<Value, TxSetXDRFrameConstPtr>;
+    auto makeTxPair = [&](TxSetXDRFrameConstPtr txSet, uint64_t closeTime,
                           StellarValueType svt) {
         StellarValue sv = herder.makeStellarValue(
             txSet->getContentsHash(), closeTime, emptyUpgradeSteps, s);
@@ -61,21 +67,13 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
         herder.signEnvelope(s, envelope);
         return envelope;
     };
-    auto addTransactionsEx = [&](TxSetFrameConstPtr& txSet, int n,
-                                 TestAccount& t) {
+    size_t index = 0;
+    auto makeTransactions = [&](Hash hash, size_t n) {
+        REQUIRE(n <= accs.size());
         std::vector<TransactionFrameBasePtr> txs(n);
         std::generate(std::begin(txs), std::end(txs),
-                      [&]() { return root.tx({createAccount(t, 10000000)}); });
-        txSet = std::make_shared<TxSetFrame const>(txSet->previousLedgerHash(),
-                                                   txs);
-    };
-    auto addTransactions = std::bind(addTransactionsEx, std::placeholders::_1,
-                                     std::placeholders::_2, a1);
-
-    auto makeTransactions = [&](Hash hash, int n) {
-        auto result = std::make_shared<TxSetFrame const>(hash);
-        addTransactions(result, n);
-        return result;
+                      [&]() { return accs[index++].tx({payment(root, 1)}); });
+        return makeTxSetFromTransactions(txs, *app, 0, 0).first;
     };
 
     auto makePublicKey = [](int i) {
@@ -112,7 +110,7 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
     }
     auto bigQSetHash = sha256(xdr::xdr_to_opaque(bigQSet));
 
-    auto txSet = makeTransactions(lcl.hash, 50);
+    auto txSet = makeTransactions(lcl.hash, numAccounts);
     auto p = makeTxPair(txSet, 10, STELLAR_VALUE_SIGNED);
     auto saneEnvelope = makeEnvelope(p, saneQSetHash, lcl.header.ledgerSeq + 1);
     auto bigEnvelope = makeEnvelope(p, bigQSetHash, lcl.header.ledgerSeq + 1);
@@ -264,24 +262,33 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
         REQUIRE(pendingEnvelopes.recvSCPEnvelope(saneEnvelope) ==
                 Herder::ENVELOPE_STATUS_PROCESSED);
 
+        auto lclNum = app->getLedgerManager().getLastClosedLedgerNum();
+        auto lastCheckpointSeq =
+            HistoryManager::lastLedgerBeforeCheckpointContaining(
+                lclNum, app->getConfig());
+
         SECTION("with slotIndex difference less or equal than "
                 "MAX_SLOTS_TO_REMEMBER")
         {
-            pendingEnvelopes.eraseBelow(saneEnvelope2.statement.slotIndex -
-                                        app->getConfig().MAX_SLOTS_TO_REMEMBER);
+            pendingEnvelopes.eraseBelow(
+                saneEnvelope2.statement.slotIndex -
+                    app->getConfig().MAX_SLOTS_TO_REMEMBER,
+                lastCheckpointSeq);
             REQUIRE(pendingEnvelopes.recvSCPEnvelope(saneEnvelope2) ==
                     Herder::ENVELOPE_STATUS_READY);
-            pendingEnvelopes.eraseBelow(saneEnvelope3.statement.slotIndex -
-                                        app->getConfig().MAX_SLOTS_TO_REMEMBER);
+            pendingEnvelopes.eraseBelow(
+                saneEnvelope3.statement.slotIndex -
+                    app->getConfig().MAX_SLOTS_TO_REMEMBER,
+                lastCheckpointSeq);
             REQUIRE(pendingEnvelopes.recvSCPEnvelope(saneEnvelope3) ==
                     Herder::ENVELOPE_STATUS_READY);
         }
 
         SECTION("with slotIndex difference bigger than MAX_SLOTS_TO_REMEMBER")
         {
-            auto minSlot = saneEnvelope3.statement.slotIndex -
-                           app->getConfig().MAX_SLOTS_TO_REMEMBER;
-            pendingEnvelopes.eraseBelow(minSlot);
+            auto const minSlot = saneEnvelope3.statement.slotIndex -
+                                 app->getConfig().MAX_SLOTS_TO_REMEMBER;
+            pendingEnvelopes.eraseBelow(minSlot, lastCheckpointSeq);
             auto saneQSetP = pendingEnvelopes.getQSet(saneQSetHash);
 
             // 3 as we have "p", "txSet" and SCP
@@ -290,7 +297,7 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
             REQUIRE(saneQSetP.use_count() == 4);
 
             // clears SCP
-            herder.getSCP().purgeSlots(minSlot);
+            herder.getSCP().purgeSlots(minSlot, lastCheckpointSeq);
             REQUIRE(txSet.use_count() == 2);
             REQUIRE(saneQSetP.use_count() == 3);
 
@@ -334,10 +341,10 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
                 Herder::ENVELOPE_STATUS_DISCARDED);
     }
 
-    SECTION("receiving malformed txset would crash but disabled check")
+    SECTION("can receive malformed tx set")
     {
-        auto malformedTxSet =
-            TestTxSetUtils::makeIllSortedTxSet(app->getNetworkID(), txSet);
+        GeneralizedTransactionSet malformedXdrSet(1);
+        auto malformedTxSet = TxSetXDRFrame::makeFromWire(malformedXdrSet);
         auto p2 = makeTxPair(malformedTxSet, 10, STELLAR_VALUE_SIGNED);
         auto malformedEnvelope =
             makeEnvelope(p2, saneQSetHash, lcl.header.ledgerSeq + 1);

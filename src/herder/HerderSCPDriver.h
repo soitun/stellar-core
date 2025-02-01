@@ -9,6 +9,7 @@
 #include "herder/TxSetUtils.h"
 #include "medida/timer.h"
 #include "scp/SCPDriver.h"
+#include "util/ProtocolVersion.h"
 #include "util/RandomEvictionCache.h"
 #include "xdr/Stellar-ledger.h"
 #include <optional>
@@ -31,6 +32,11 @@ class Upgrades;
 class VirtualTimer;
 struct StellarValue;
 struct SCPEnvelope;
+
+// First protocol version supporting the application-specific weight function
+// for SCP leader election.
+ProtocolVersion constexpr APPLICATION_SPECIFIC_NOMINATION_LEADER_ELECTION_PROTOCOL_VERSION =
+    ProtocolVersion::V_22;
 
 class HerderSCPDriver : public SCPDriver
 {
@@ -75,6 +81,8 @@ class HerderSCPDriver : public SCPDriver
                     std::chrono::milliseconds timeout,
                     std::function<void()> cb) override;
 
+    void stopTimer(uint64 slotIndex, int timerID) override;
+
     // hashing support
     Hash getHashOf(std::vector<xdr::opaque_vec<>> const& vals) const override;
 
@@ -87,7 +95,7 @@ class HerderSCPDriver : public SCPDriver
     // Submit a value to consider for slotIndex
     // previousValue is the value from slotIndex-1
     void nominate(uint64_t slotIndex, StellarValue const& value,
-                  TxSetFrameConstPtr proposedSet,
+                  TxSetXDRFrameConstPtr proposedSet,
                   StellarValue const& previousValue);
 
     SCPQuorumSetPtr getQSet(Hash const& qSetHash) override;
@@ -121,11 +129,19 @@ class HerderSCPDriver : public SCPDriver
     ValueWrapperPtr wrapValue(Value const& sv) override;
 
     // clean up older slots
-    void purgeSlots(uint64_t maxSlotIndex);
+    void purgeSlots(uint64_t maxSlotIndex, uint64 slotToKeep);
 
     double getExternalizeLag(NodeID const& id) const;
 
     Json::Value getQsetLagInfo(bool summary, bool fullKeys);
+
+    // Application-specific weight function. This function uses the quality
+    // levels from automatic quorum set generation to determine the weight of a
+    // validator. It is designed to ensure that:
+    // 1. Orgs of equal quality have equal chances of winning leader election.
+    // 2. Higher quality orgs win more frequently than lower quality orgs.
+    uint64 getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
+                         bool isLocalNode) const override;
 
   private:
     Application& mApp;
@@ -162,6 +178,8 @@ class HerderSCPDriver : public SCPDriver
     medida::Histogram& mNominateTimeout;
     // Prepare timeouts per ledger
     medida::Histogram& mPrepareTimeout;
+    // Unique values referenced per ledger
+    medida::Histogram& mUniqueValues;
 
     // Externalize lag tracking for nodes in qset
     UnorderedMap<NodeID, medida::Timer> mQSetLag;
@@ -192,17 +210,24 @@ class HerderSCPDriver : public SCPDriver
     // timers used by SCP
     // indexed by slotIndex, timerID
     std::map<uint64_t, std::map<int, std::unique_ptr<VirtualTimer>>> mSCPTimers;
+    // For caching TxSet validity. Consist of {lcl.hash, txSetHash,
+    // lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset}
+    using TxSetValidityKey = std::tuple<Hash, Hash, uint64_t, uint64_t>;
 
+    class TxSetValidityKeyHash
+    {
+      public:
+        size_t operator()(TxSetValidityKey const& key) const;
+    };
     // validity of txSet
-    mutable RandomEvictionCache<TxSetUtils::TxSetValidityKey, bool,
-                                TxSetUtils::TxSetValidityKeyHash>
+    mutable RandomEvictionCache<TxSetValidityKey, bool, TxSetValidityKeyHash>
         mTxSetValidCache;
 
     SCPDriver::ValidationLevel validateValueHelper(uint64_t slotIndex,
                                                    StellarValue const& sv,
                                                    bool nomination) const;
 
-    void logQuorumInformation(uint64_t index);
+    void logQuorumInformationAndUpdateMetrics(uint64_t index);
 
     void clearSCPExecutionEvents();
 
@@ -215,7 +240,8 @@ class HerderSCPDriver : public SCPDriver
                          std::chrono::nanoseconds threshold,
                          uint64_t slotIndex);
 
-    bool checkAndCacheTxSetValid(TxSetFrameConstPtr TxSet,
+    bool checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
+                                 LedgerHeaderHistoryEntry const& lcl,
                                  uint64_t closeTimeOffset) const;
 };
 }

@@ -10,9 +10,11 @@
 #include "util/Fs.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
+#include "util/types.h"
 #include "xdrpp/marshal.h"
 #include <Tracy.hpp>
 
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -65,6 +67,12 @@ class XDRInputFileStream
         mSize = fs::size(mIn);
     }
 
+    void
+    open(std::filesystem::path const& filename)
+    {
+        open(filename.string());
+    }
+
     operator bool() const
     {
         return mIn.good();
@@ -76,12 +84,34 @@ class XDRInputFileStream
         return mSize;
     }
 
-    size_t
+    std::streamoff
     pos()
     {
         releaseAssertOrThrow(!mIn.fail());
-
         return mIn.tellg();
+    }
+
+    void
+    seek(size_t pos)
+    {
+        releaseAssertOrThrow(!mIn.fail());
+        mIn.seekg(pos);
+    }
+
+    static inline uint32_t
+    getXDRSize(char* buf)
+    {
+        // Read 4 bytes of size, big-endian, with XDR 'continuation' bit cleared
+        // (high bit of high byte).
+        uint32_t sz = 0;
+        sz |= static_cast<uint8_t>(buf[0] & '\x7f');
+        sz <<= 8;
+        sz |= static_cast<uint8_t>(buf[1]);
+        sz <<= 8;
+        sz |= static_cast<uint8_t>(buf[2]);
+        sz <<= 8;
+        sz |= static_cast<uint8_t>(buf[3]);
+        return sz;
     }
 
     template <typename T>
@@ -92,20 +122,19 @@ class XDRInputFileStream
         char szBuf[4];
         if (!mIn.read(szBuf, 4))
         {
-            return false;
+            // checks that there was no trailing data
+            if (mIn.eof() && mIn.gcount() == 0)
+            {
+                mIn.clear(std::ios_base::eofbit);
+                return false;
+            }
+            else
+            {
+                throw xdr::xdr_runtime_error("IO failure in readOne");
+            }
         }
 
-        // Read 4 bytes of size, big-endian, with XDR 'continuation' bit cleared
-        // (high bit of high byte).
-        uint32_t sz = 0;
-        sz |= static_cast<uint8_t>(szBuf[0] & '\x7f');
-        sz <<= 8;
-        sz |= static_cast<uint8_t>(szBuf[1]);
-        sz <<= 8;
-        sz |= static_cast<uint8_t>(szBuf[2]);
-        sz <<= 8;
-        sz |= static_cast<uint8_t>(szBuf[3]);
-
+        auto sz = getXDRSize(szBuf);
         if (mSizeLimit != 0 && sz > mSizeLimit)
         {
             return false;
@@ -116,18 +145,98 @@ class XDRInputFileStream
         }
         if (!mIn.read(mBuf.data(), sz))
         {
-            throw xdr::xdr_runtime_error("malformed XDR file");
+            throw xdr::xdr_runtime_error(
+                "malformed XDR file or IO failure in readOne");
         }
+
         xdr::xdr_get g(mBuf.data(), mBuf.data() + sz);
         xdr::xdr_argpack_archive(g, out);
         return true;
     }
+
+    // `readPage` reads records of XDR type `T` from the stream into output
+    // variable `out`, until it has exceeded `pageSize` bytes or until it finds
+    // an `out` value for which `getBucketLedgerKey(out) == key`. It returns
+    // `true` if it located such a value, or false if it failed to find one.
+    template <typename T>
+    bool
+    readPage(T& out, LedgerKey const& key, size_t pageSize)
+    {
+        ZoneScoped;
+        if (mBuf.size() != pageSize)
+        {
+            mBuf.resize(pageSize);
+        }
+
+        if (!mIn.read(mBuf.data(), pageSize))
+        {
+            if (mIn.eof())
+            {
+                // Hitting eof just means there's not a full pageSize
+                // worth of data left in the file. Not a problem: resize our
+                // buffer down to the amount the page we _did_ manage to read.
+                mBuf.resize(mIn.gcount());
+                mIn.clear(std::ios_base::eofbit);
+            }
+            else
+            {
+                throw xdr::xdr_runtime_error("IO failure in readPage");
+            }
+        }
+
+        size_t xdrStart = 0;
+        while (xdrStart + 4 <= mBuf.size())
+        {
+            const uint32_t xdrSz = getXDRSize(mBuf.data() + xdrStart);
+            xdrStart += 4;
+            const size_t xdrEnd = xdrStart + xdrSz;
+
+            // If entry continues past end of buffer, temporarily expand
+            // it and load the extra bytes. The buffer will be resized
+            // back to pageSize in the next readPage.
+            if (xdrEnd > mBuf.size())
+            {
+                const size_t extraStart = mBuf.size();
+                const size_t extraSz = xdrEnd - extraStart;
+                mBuf.resize(xdrEnd);
+                releaseAssert(extraStart + extraSz == mBuf.size());
+                if (!mIn.read(mBuf.data() + extraStart, extraSz))
+                {
+                    throw xdr::xdr_runtime_error(
+                        "malformed XDR file or IO failure in readPage");
+                }
+            }
+
+            ZoneNamedN(__unpack, "xdr_unpack_entry", true);
+            releaseAssert(xdrStart <= xdrEnd);
+            releaseAssert(xdrEnd <= mBuf.size());
+            xdr::xdr_get g(mBuf.data() + xdrStart, mBuf.data() + xdrEnd);
+            xdr::xdr_argpack_archive(g, out);
+            if (getBucketLedgerKey(out) == key)
+            {
+                return true;
+            }
+
+            xdrStart = xdrEnd;
+        }
+
+        return false;
+    }
 };
 
-// XDROutputFileStream needs access to a file descriptor to do fsync, so we use
-// asio's synchronous stream types here rather than fstreams.
-class XDROutputFileStream
+/*
+IMPORTANT: some areas of core require durable writes that
+are resistant to application and system crashes. If you need durable writes:
+1. Use a stream implementation that supports fsync, e.g. OutputFileStream
+2. Write to a temp file first. If you don't intent to persist temp files across
+runs, fsyncing on close is sufficient. Otherwise, use durableWriteOne to flush
+and fsync after every write.
+3. Close the temp stream to make sure flush and fsync are called.
+4. Rename the temp file to the final location using durableRename.
+*/
+class OutputFileStream
 {
+  protected:
     std::vector<char> mBuf;
     const bool mFsyncOnClose;
 
@@ -136,12 +245,13 @@ class XDROutputFileStream
     fs::native_handle_t mHandle;
     FILE* mOut{nullptr};
 #else
-    // buffered stream
+    // use buffered stream which supports accessing a file descriptor needed to
+    // fsync
     asio::buffered_write_stream<stellar::fs::stream_t> mBufferedWriteStream;
 #endif
 
   public:
-    XDROutputFileStream(asio::io_context& ctx, bool fsyncOnClose)
+    OutputFileStream(asio::io_context& ctx, bool fsyncOnClose)
         : mFsyncOnClose(fsyncOnClose)
 #ifndef WIN32
         , mBufferedWriteStream(ctx, stellar::fs::bufsz())
@@ -149,7 +259,7 @@ class XDROutputFileStream
     {
     }
 
-    ~XDROutputFileStream()
+    ~OutputFileStream()
     {
         if (isOpen())
         {
@@ -277,17 +387,73 @@ class XDROutputFileStream
         return isOpen();
     }
 
-    template <typename T>
     void
-    writeOne(T const& t, SHA256* hasher = nullptr, size_t* bytesPut = nullptr)
+    writeBytes(char const* buf, size_t const sizeBytes)
     {
         ZoneScoped;
         if (!isOpen())
         {
             FileSystemException::failWith(
-                "XDROutputFileStream::writeOne() on non-open stream");
+                "OutputFileStream::writeBytes() on non-open stream");
         }
 
+        size_t written = 0;
+        while (written < sizeBytes)
+        {
+#ifdef WIN32
+            auto w = fwrite(buf + written, 1, sizeBytes - written, mOut);
+            if (w == 0)
+            {
+                FileSystemException::failWith(
+                    std::string("XDROutputFileStream::writeOne() failed"));
+            }
+            written += w;
+#else
+            asio::error_code ec;
+            auto asioBuf = asio::buffer(buf + written, sizeBytes - written);
+            written += asio::write(mBufferedWriteStream, asioBuf, ec);
+            if (ec)
+            {
+                if (ec == asio::error::interrupted)
+                {
+                    continue;
+                }
+                else
+                {
+                    FileSystemException::failWith(
+                        std::string(
+                            "XDROutputFileStream::writeOne() failed: ") +
+                        ec.message());
+                }
+            }
+#endif
+        }
+    }
+};
+
+class XDROutputFileStream : public OutputFileStream
+{
+  public:
+    XDROutputFileStream(asio::io_context& ctx, bool fsyncOnClose)
+        : OutputFileStream(ctx, fsyncOnClose)
+    {
+    }
+
+    template <typename T>
+    void
+    durableWriteOne(T const& t, SHA256* hasher = nullptr,
+                    size_t* bytesPut = nullptr)
+    {
+        writeOne(t, hasher, bytesPut);
+        flush();
+        fs::flushFileChanges(getHandle());
+    }
+
+    template <typename T>
+    void
+    writeOne(T const& t, SHA256* hasher = nullptr, size_t* bytesPut = nullptr)
+    {
+        ZoneScoped;
         uint32_t sz = (uint32_t)xdr::xdr_size(t);
         releaseAssertOrThrow(sz < 0x80000000);
 
@@ -305,41 +471,13 @@ class XDROutputFileStream
         xdr::xdr_put p(mBuf.data() + 4, mBuf.data() + 4 + sz);
         xdr_argpack_archive(p, t);
 
-        size_t const to_write = sz + 4;
-        size_t written = 0;
-        while (written < to_write)
-        {
-#ifdef WIN32
-            auto w = fwrite(mBuf.data() + written, 1, to_write - written, mOut);
-            if (w == 0)
-            {
-                FileSystemException::failWith(
-                    std::string("XDROutputFileStream::writeOne() failed"));
-            }
-            written += w;
-#else
-            asio::error_code ec;
-            auto buf = asio::buffer(mBuf.data() + written, to_write - written);
-            written += asio::write(mBufferedWriteStream, buf, ec);
-            if (ec)
-            {
-                if (ec == asio::error::interrupted)
-                {
-                    continue;
-                }
-                else
-                {
-                    FileSystemException::failWith(
-                        std::string(
-                            "XDROutputFileStream::writeOne() failed: ") +
-                        ec.message());
-                }
-            }
-#endif
-        }
+        // Buffer is 4 bytes of encoded size, followed by encoded object
+        size_t const toWrite = sz + 4;
+        writeBytes(mBuf.data(), toWrite);
+
         if (hasher)
         {
-            hasher->add(ByteSlice(mBuf.data(), sz + 4));
+            hasher->add(ByteSlice(mBuf.data(), toWrite));
         }
         if (bytesPut)
         {

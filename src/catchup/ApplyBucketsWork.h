@@ -5,24 +5,27 @@
 #pragma once
 
 #include "bucket/BucketApplicator.h"
+#include "ledger/LedgerHashUtils.h"
 #include "work/Work.h"
 
 namespace stellar
 {
 
-class BucketLevel;
-class BucketList;
+class AssumeStateWork;
+class LiveBucketList;
 class Bucket;
+class IndexBucketsWork;
 struct HistoryArchiveState;
 struct LedgerHeaderHistoryEntry;
 
-class ApplyBucketsWork : public BasicWork
+class ApplyBucketsWork : public Work
 {
-    std::map<std::string, std::shared_ptr<Bucket>> const& mBuckets;
+    std::map<std::string, std::shared_ptr<LiveBucket>> const& mBuckets;
     HistoryArchiveState const& mApplyState;
-    std::function<bool(LedgerEntryType)> mEntryTypeFilter;
 
-    bool mApplying{false};
+    bool mSpawnedAssumeStateWork{false};
+    std::shared_ptr<AssumeStateWork> mAssumeStateWork{};
+    std::shared_ptr<IndexBucketsWork> mIndexBucketsWork{};
     size_t mTotalBuckets{0};
     size_t mAppliedBuckets{0};
     size_t mAppliedEntries{0};
@@ -30,45 +33,36 @@ class ApplyBucketsWork : public BasicWork
     size_t mAppliedSize{0};
     size_t mLastAppliedSizeMb{0};
     size_t mLastPos{0};
+    size_t mBucketToApplyIndex{0};
     uint32_t mLevel{0};
     uint32_t mMaxProtocolVersion{0};
     uint32_t mMinProtocolVersionSeen{UINT32_MAX};
-    std::shared_ptr<Bucket const> mSnapBucket;
-    std::shared_ptr<Bucket const> mCurrBucket;
-    std::unique_ptr<BucketApplicator> mSnapApplicator;
-    std::unique_ptr<BucketApplicator> mCurrApplicator;
+    std::unordered_set<LedgerKey> mSeenKeysBeforeApply;
+    std::unordered_set<LedgerKey> mSeenKeys;
+    std::vector<std::shared_ptr<LiveBucket>> mBucketsToApply;
+    std::unique_ptr<BucketApplicator> mBucketApplicator;
 
     BucketApplicator::Counters mCounters;
+    bool const mIsApplyInvariantEnabled;
 
     void advance(std::string const& name, BucketApplicator& applicator);
-    std::shared_ptr<Bucket const> getBucket(std::string const& bucketHash);
-    BucketLevel& getBucketLevel(uint32_t level);
-    void startLevel();
-    bool isLevelComplete();
+    std::shared_ptr<LiveBucket> getBucket(std::string const& bucketHash);
 
-    bool mDelayChecked{false};
+    bool appliedAllBuckets() const;
+    void startBucket();
+    void prepareForNextBucket();
 
   public:
     ApplyBucketsWork(
         Application& app,
-        std::map<std::string, std::shared_ptr<Bucket>> const& buckets,
+        std::map<std::string, std::shared_ptr<LiveBucket>> const& buckets,
         HistoryArchiveState const& applyState, uint32_t maxProtocolVersion);
-    ApplyBucketsWork(
-        Application& app,
-        std::map<std::string, std::shared_ptr<Bucket>> const& buckets,
-        HistoryArchiveState const& applyState, uint32_t maxProtocolVersion,
-        std::function<bool(LedgerEntryType)> onlyApply);
     ~ApplyBucketsWork() = default;
 
     std::string getStatus() const override;
 
   protected:
-    void onReset() override;
-    BasicWork::State onRun() override;
-    bool
-    onAbort() override
-    {
-        return true;
-    };
+    void doReset() override;
+    BasicWork::State doWork() override;
 };
 }

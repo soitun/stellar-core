@@ -53,7 +53,7 @@ randomizePredicatePos(ClaimPredicate pred1, ClaimPredicate pred2,
                       xdr::xvector<ClaimPredicate, 2>& vec)
 {
     stellar::uniform_int_distribution<size_t> dist(0, 1);
-    bool randBool = dist(gRandomEngine);
+    bool randBool = dist(Catch::rng());
 
     auto const& firstPred = randBool ? pred1 : pred2;
     auto const& secondPred = randBool ? pred2 : pred1;
@@ -176,9 +176,9 @@ validateBalancesOnCreateAndClaim(TestAccount& createAcc, TestAccount& claimAcc,
             {createAcc});
 
         LedgerTxn ltx(app.getLedgerTxnRoot());
-        TransactionMeta txm(2);
-        REQUIRE(tx->checkValid(ltx, 0, 0, 0));
-        REQUIRE(tx->apply(app, ltx, txm));
+        TransactionMetaFrame txm(ltx.loadHeader().current().ledgerVersion);
+        REQUIRE(tx->checkValidForTesting(app.getAppConnector(), ltx, 0, 0, 0));
+        REQUIRE(tx->apply(app.getAppConnector(), ltx, txm));
         REQUIRE(tx->getResultCode() == txSUCCESS);
 
         // the create is the second op in the tx
@@ -235,9 +235,9 @@ validateBalancesOnCreateAndClaim(TestAccount& createAcc, TestAccount& claimAcc,
             {createAcc});
 
         LedgerTxn ltx(app.getLedgerTxnRoot());
-        TransactionMeta txm(2);
-        REQUIRE(tx->checkValid(ltx, 0, 0, 0));
-        REQUIRE(tx->apply(app, ltx, txm));
+        TransactionMetaFrame txm(ltx.loadHeader().current().ledgerVersion);
+        REQUIRE(tx->checkValidForTesting(app.getAppConnector(), ltx, 0, 0, 0));
+        REQUIRE(tx->apply(app.getAppConnector(), ltx, txm));
         ltx.commit();
 
         REQUIRE(tx->getResultCode() == txSUCCESS);
@@ -256,9 +256,9 @@ validateBalancesOnCreateAndClaim(TestAccount& createAcc, TestAccount& claimAcc,
             {claimAcc});
 
         LedgerTxn ltx(app.getLedgerTxnRoot());
-        TransactionMeta txm(2);
-        REQUIRE(tx->checkValid(ltx, 0, 0, 0));
-        REQUIRE(tx->apply(app, ltx, txm));
+        TransactionMetaFrame txm(ltx.loadHeader().current().ledgerVersion);
+        REQUIRE(tx->checkValidForTesting(app.getAppConnector(), ltx, 0, 0, 0));
+        REQUIRE(tx->apply(app.getAppConnector(), ltx, txm));
         ltx.commit();
 
         REQUIRE(tx->getResultCode() == txSUCCESS);
@@ -298,7 +298,7 @@ validateBalancesOnCreateAndClaim(TestAccount& createAcc, TestAccount& claimAcc,
 
 TEST_CASE_VERSIONS("claimableBalance", "[tx][claimablebalance]")
 {
-    Config cfg = getTestConfig();
+    Config cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
 
     VirtualClock clock;
     auto app = createTestApplication(clock, cfg);
@@ -324,7 +324,6 @@ TEST_CASE_VERSIONS("claimableBalance", "[tx][claimablebalance]")
     auto simplePred = makeSimplePredicate(3); // validPredicate
 
     xdr::xvector<Claimant, 10> validClaimants{makeClaimant(acc2, simplePred)};
-
     SECTION("not supported before version 14")
     {
         for_versions_to(13, *app, [&] {
@@ -1164,9 +1163,10 @@ TEST_CASE_VERSIONS("claimableBalance", "[tx][claimablebalance]")
                 {acc1});
 
             LedgerTxn ltx(app->getLedgerTxnRoot());
-            TransactionMeta txm(2);
-            REQUIRE(tx->checkValid(ltx, 0, 0, 0));
-            REQUIRE(tx->apply(*app, ltx, txm));
+            TransactionMetaFrame txm(ltx.loadHeader().current().ledgerVersion);
+            REQUIRE(
+                tx->checkValidForTesting(app->getAppConnector(), ltx, 0, 0, 0));
+            REQUIRE(tx->apply(app->getAppConnector(), ltx, txm));
             REQUIRE(tx->getResultCode() == txSUCCESS);
 
             auto balanceID = root.getBalanceID(1);
@@ -1177,9 +1177,10 @@ TEST_CASE_VERSIONS("claimableBalance", "[tx][claimablebalance]")
                 {root.op(revokeSponsorship(claimableBalanceKey(balanceID)))},
                 {});
 
-            TransactionMeta txm2(2);
-            REQUIRE(tx2->checkValid(ltx, 0, 0, 0));
-            REQUIRE(!tx2->apply(*app, ltx, txm2));
+            TransactionMetaFrame txm2(ltx.loadHeader().current().ledgerVersion);
+            REQUIRE(tx2->checkValidForTesting(app->getAppConnector(), ltx, 0, 0,
+                                              0));
+            REQUIRE(!tx2->apply(app->getAppConnector(), ltx, txm2));
             REQUIRE(tx2->getResultCode() == txFAILED);
 
             REQUIRE(tx2->getResult()
@@ -1241,9 +1242,11 @@ TEST_CASE_VERSIONS("claimableBalance", "[tx][claimablebalance]")
                         {acc2});
 
                     LedgerTxn ltx(app->getLedgerTxnRoot());
-                    TransactionMeta txm(2);
-                    REQUIRE(tx->checkValid(ltx, 0, 0, 0));
-                    REQUIRE(tx->apply(*app, ltx, txm));
+                    TransactionMetaFrame txm(
+                        ltx.loadHeader().current().ledgerVersion);
+                    REQUIRE(tx->checkValidForTesting(app->getAppConnector(),
+                                                     ltx, 0, 0, 0));
+                    REQUIRE(tx->apply(app->getAppConnector(), ltx, txm));
                     REQUIRE(tx->getResultCode() == txSUCCESS);
                     ltx.commit();
                 }
@@ -1270,9 +1273,11 @@ TEST_CASE_VERSIONS("claimableBalance", "[tx][claimablebalance]")
                         {claimAccount});
 
                     LedgerTxn ltx(app->getLedgerTxnRoot());
-                    TransactionMeta txm2(2);
-                    REQUIRE(tx2->checkValid(ltx, 0, 0, 0));
-                    REQUIRE(tx2->apply(*app, ltx, txm2));
+                    TransactionMetaFrame txm2(
+                        ltx.loadHeader().current().ledgerVersion);
+                    REQUIRE(tx2->checkValidForTesting(app->getAppConnector(),
+                                                      ltx, 0, 0, 0));
+                    REQUIRE(tx2->apply(app->getAppConnector(), ltx, txm2));
                     REQUIRE(tx2->getResultCode() == txSUCCESS);
 
                     // increment ledgerSeq
@@ -1296,11 +1301,7 @@ TEST_CASE_VERSIONS("claimableBalance", "[tx][claimablebalance]")
                 lastModifiedTest(false);
             }
 
-            uint32_t ledgerVersion;
-            {
-                LedgerTxn ltx(app->getLedgerTxnRoot());
-                ledgerVersion = ltx.loadHeader().current().ledgerVersion;
-            }
+            auto ledgerVersion = getLclProtocolVersion(*app);
 
             if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_17))
             {

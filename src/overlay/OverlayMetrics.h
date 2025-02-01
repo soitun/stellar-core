@@ -19,6 +19,7 @@ namespace stellar
 
 class Application;
 
+// OverlayMetrics is a thread-safe struct
 struct OverlayMetrics
 {
     OverlayMetrics(Application& app);
@@ -34,6 +35,8 @@ struct OverlayMetrics
     medida::Meter& mTimeoutIdle;
     medida::Meter& mTimeoutStraggler;
     medida::Timer& mConnectionLatencyTimer;
+    medida::Timer& mConnectionReadThrottle;
+    medida::Timer& mConnectionFloodThrottle;
 
     medida::Meter& mItemFetcherNextPeer;
 
@@ -41,7 +44,6 @@ struct OverlayMetrics
     medida::Timer& mRecvHelloTimer;
     medida::Timer& mRecvAuthTimer;
     medida::Timer& mRecvDontHaveTimer;
-    medida::Timer& mRecvGetPeersTimer;
     medida::Timer& mRecvPeersTimer;
     medida::Timer& mRecvGetTxSetTimer;
     medida::Timer& mRecvTxSetTimer;
@@ -59,18 +61,28 @@ struct OverlayMetrics
 
     medida::Timer& mRecvSurveyRequestTimer;
     medida::Timer& mRecvSurveyResponseTimer;
+    medida::Timer& mRecvStartSurveyCollectingTimer;
+    medida::Timer& mRecvStopSurveyCollectingTimer;
+
+    medida::Timer& mRecvFloodAdvertTimer;
+    medida::Timer& mRecvFloodDemandTimer;
 
     medida::Timer& mMessageDelayInWriteQueueTimer;
     medida::Timer& mMessageDelayInAsyncWriteTimer;
 
     medida::Timer& mOutboundQueueDelaySCP;
     medida::Timer& mOutboundQueueDelayTxs;
+    medida::Timer& mOutboundQueueDelayAdvert;
+    medida::Timer& mOutboundQueueDelayDemand;
+    medida::Meter& mOutboundQueueDropSCP;
+    medida::Meter& mOutboundQueueDropTxs;
+    medida::Meter& mOutboundQueueDropAdvert;
+    medida::Meter& mOutboundQueueDropDemand;
 
     medida::Meter& mSendErrorMeter;
     medida::Meter& mSendHelloMeter;
     medida::Meter& mSendAuthMeter;
     medida::Meter& mSendDontHaveMeter;
-    medida::Meter& mSendGetPeersMeter;
     medida::Meter& mSendPeersMeter;
     medida::Meter& mSendGetTxSetMeter;
     medida::Meter& mSendTransactionMeter;
@@ -83,11 +95,28 @@ struct OverlayMetrics
 
     medida::Meter& mSendSurveyRequestMeter;
     medida::Meter& mSendSurveyResponseMeter;
+    medida::Meter& mSendStartSurveyCollectingMeter;
+    medida::Meter& mSendStopSurveyCollectingMeter;
+
+    medida::Meter& mSendFloodAdvertMeter;
+    medida::Meter& mSendFloodDemandMeter;
+    medida::Meter& mMessagesDemanded;
+    medida::Meter& mMessagesFulfilledMeter;
+    medida::Meter& mBannedMessageUnfulfilledMeter;
+    medida::Meter& mUnknownMessageUnfulfilledMeter;
+    medida::Timer& mTxPullLatency;
+    medida::Timer& mPeerTxPullLatency;
+    medida::Timer& mAdvertQueueDelay;
+
+    medida::Meter& mDemandTimeouts;
+    medida::Meter& mPulledRelevantTxs;
+    medida::Meter& mPulledIrrelevantTxs;
+
+    medida::Meter& mAbandonedDemandMeter;
 
     medida::Meter& mMessagesBroadcast;
     medida::Counter& mPendingPeersSize;
     medida::Counter& mAuthenticatedPeersSize;
-    medida::Counter& mFlowControlPercent;
 
     medida::Meter& mUniqueFloodBytesRecv;
     medida::Meter& mDuplicateFloodBytesRecv;

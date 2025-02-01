@@ -23,6 +23,20 @@
 	path = lib/spdlog
 	url = https://github.com/gabime/spdlog
 	ignore = dirty
-[submodule "lib/rs-stellar-contract-env"]
-	path = lib/rs-stellar-contract-env
-	url = https://github.com/stellar/rs-stellar-contract-env
+[submodule "src/protocol-next/xdr"]
+	path = src/protocol-next/xdr
+	url = https://github.com/stellar/stellar-xdr
+	branch = next
+[submodule "src/protocol-curr/xdr"]
+	path = src/protocol-curr/xdr
+	url = https://github.com/stellar/stellar-xdr
+	branch = curr
+[submodule "src/rust/soroban/p21"]
+	path = src/rust/soroban/p21
+	url = https://github.com/stellar/rs-soroban-env
+[submodule "src/rust/soroban/p22"]
+	path = src/rust/soroban/p22
+	url = https://github.com/stellar/rs-soroban-env
+[submodule "src/rust/soroban/p23"]
+	path = src/rust/soroban/p23
+	url = https://github.com/stellar/rs-soroban-env.git

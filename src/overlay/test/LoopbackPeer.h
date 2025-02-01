@@ -4,6 +4,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "overlay/FlowControl.h"
 #include "overlay/Peer.h"
 #include <deque>
 #include <random>
@@ -56,16 +57,21 @@ class LoopbackPeer : public Peer
     AuthCert getAuthCert() override;
 
     void processInQueue();
-
-    std::string mDropReason;
+    void recvMessage(xdr::msg_ptr const& xdrBytes);
 
   public:
     virtual ~LoopbackPeer()
     {
     }
     LoopbackPeer(Application& app, PeerRole role);
-    void drop(std::string const& reason, DropDirection dropDirection,
-              DropMode dropMode) override;
+
+    void recvMessage(std::shared_ptr<CapacityTrackedMessage> msgTracker);
+
+    static std::pair<std::shared_ptr<LoopbackPeer>,
+                     std::shared_ptr<LoopbackPeer>>
+    initiate(Application& app, Application& otherApp);
+
+    void drop(std::string const& reason, DropDirection dropDirection) override;
 
     void deliverOne();
     void deliverAll();
@@ -106,34 +112,51 @@ class LoopbackPeer : public Peer
 
     void clearInAndOutQueues();
 
+    virtual bool
+    useBackgroundThread() const override
+    {
+        return false;
+    }
+
+    size_t
+    getTxQueueByteCount() const
+    {
+        return mFlowControl->getTxQueueByteCountForTesting();
+    }
+
     std::string
     getDropReason() const
     {
         return mDropReason;
     }
 
-    std::array<std::deque<QueuedOutboundMessage>, 2>&
+    std::array<std::deque<FlowControl::QueuedOutboundMessage>, 4>&
     getQueues()
     {
-        return mOutboundQueues;
+        return getFlowControl()->getQueuesForTesting();
     }
 
-    uint64_t&
+    uint64_t
     getOutboundCapacity()
     {
-        return mOutboundCapacity;
+        return getFlowControl()->getCapacity().getOutboundCapacity();
     }
 
-    bool checkCapacity(uint64_t expectedOutboundCapacity) const;
+    Config const&
+    getConfig()
+    {
+        return mAppConnector.getConfig();
+    }
 
-    std::string getIP() const override;
+    bool checkCapacity(std::shared_ptr<LoopbackPeer> otherPeer) const;
 
-    using Peer::addMsgAndMaybeTrimQueue;
-    using Peer::flowControlEnabled;
+    std::string getIP() const;
+
+    using Peer::recvMessage;
     using Peer::sendAuth;
     using Peer::sendAuthenticatedMessage;
     using Peer::sendMessage;
-    using Peer::sendSendMore;
+    using Peer::sendPeers;
 
     friend class LoopbackPeerConnection;
 };

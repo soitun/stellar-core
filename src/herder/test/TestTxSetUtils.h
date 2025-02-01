@@ -5,21 +5,34 @@
 #pragma once
 
 #include "herder/TxSetUtils.h"
+#include "xdr/Stellar-ledger.h"
 
 namespace stellar
 {
-class TestTxSetUtils
+namespace testtxset
 {
-  public:
-    static TxSetFrameConstPtr addTxs(TxSetFrameConstPtr txSet,
-                                     TxSetFrame::Transactions const& newTxs);
 
-    static TxSetFrameConstPtr
-    removeTxs(TxSetFrameConstPtr txSet,
-              TxSetFrame::Transactions const& txsToRemove);
+using PhaseComponents = std::vector<
+    std::pair<std::optional<int64_t>, std::vector<TransactionFrameBasePtr>>>;
+std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
+makeNonValidatedGeneralizedTxSet(
+    std::vector<PhaseComponents> const& txsPerBaseFee, Application& app,
+    Hash const& previousLedgerHash,
+    std::optional<bool> useParallelSorobanPhase = std::nullopt);
 
-    static TxSetFrameConstPtr makeIllSortedTxSet(Hash const& networkID,
-                                                 TxSetFrameConstPtr goodTxSet);
+std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
+makeNonValidatedTxSetBasedOnLedgerVersion(
+    std::vector<TransactionFrameBasePtr> const& txs, Application& app,
+    Hash const& previousLedgerHash);
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+void normalizeParallelPhaseXDR(TransactionPhase& phase);
 
-}; // class TestTxSetUtils
+std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
+makeNonValidatedGeneralizedTxSet(PhaseComponents const& classicTxsPerBaseFee,
+                                 std::optional<int64_t> sorobanBaseFee,
+                                 TxStageFrameList const& sorobanTxsPerStage,
+                                 Application& app,
+                                 Hash const& previousLedgerHash);
+#endif
+} // namespace testtxset
 } // namespace stellar

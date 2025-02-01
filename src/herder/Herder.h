@@ -46,6 +46,10 @@ class Herder
     // timeout before triggering out of sync recovery
     static std::chrono::seconds const OUT_OF_SYNC_RECOVERY_TIMER;
 
+    // Timeout before sending latest checkpoint ledger after sending current SCP
+    // state
+    static std::chrono::seconds const SEND_LATEST_CHECKPOINT_DELAY;
+
     // Maximum time slip between nodes.
     static std::chrono::seconds constexpr MAX_TIME_SLIP_SECONDS =
         std::chrono::seconds{60};
@@ -64,6 +68,10 @@ class Herder
     // number of additional ledgers we retrieve from peers before our own lcl,
     // this is to help recover potential missing SCP messages for other nodes
     static uint32 const SCP_EXTRA_LOOKBACK_LEDGERS;
+
+    static uint32 const FLOW_CONTROL_BYTES_EXTRA_BUFFER;
+
+    static std::chrono::minutes const TX_SET_GC_DELAY;
 
     enum State
     {
@@ -106,7 +114,8 @@ class Herder
     // restores Herder's state from disk
     virtual void start() = 0;
 
-    virtual void lastClosedLedgerIncreased() = 0;
+    virtual void lastClosedLedgerIncreased(bool latest,
+                                           TxSetXDRFrameConstPtr txSet) = 0;
 
     // Setup Herder's state to fully participate in consensus
     virtual void setTrackingSCPState(uint64_t index, StellarValue const& value,
@@ -114,36 +123,54 @@ class Herder
 
     virtual bool recvSCPQuorumSet(Hash const& hash,
                                   SCPQuorumSet const& qset) = 0;
-    virtual bool recvTxSet(Hash const& hash, TxSetFrame const& txset) = 0;
+    virtual bool recvTxSet(Hash const& hash, TxSetXDRFrameConstPtr txset) = 0;
     // We are learning about a new transaction.
     virtual TransactionQueue::AddResult
     recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf) = 0;
     virtual void peerDoesntHave(stellar::MessageType type,
                                 uint256 const& itemID, Peer::pointer peer) = 0;
-    virtual TxSetFrameConstPtr getTxSet(Hash const& hash) = 0;
+    virtual TxSetXDRFrameConstPtr getTxSet(Hash const& hash) = 0;
     virtual SCPQuorumSetPtr getQSet(Hash const& qSetHash) = 0;
 
     // We are learning about a new envelope.
     virtual EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope) = 0;
 
+    virtual bool isTracking() const = 0;
+
 #ifdef BUILD_TESTS
     // We are learning about a new fully-fetched envelope.
     virtual EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,
                                            const SCPQuorumSet& qset,
-                                           TxSetFrame txset) = 0;
+                                           TxSetXDRFrameConstPtr txset) = 0;
+    virtual EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,
+                                           const SCPQuorumSet& qset,
+                                           StellarMessage const& txset) = 0;
 
     virtual void
-    externalizeValue(TxSetFrameConstPtr txSet, uint32_t ledgerSeq,
+    externalizeValue(TxSetXDRFrameConstPtr txSet, uint32_t ledgerSeq,
                      uint64_t closeTime,
                      xdr::xvector<UpgradeType, 6> const& upgrades,
                      std::optional<SecretKey> skToSignValue = std::nullopt) = 0;
 
     virtual VirtualTimer const& getTriggerTimer() const = 0;
+    virtual void setMaxClassicTxSize(uint32 bytes) = 0;
+    virtual void setMaxTxSize(uint32 bytes) = 0;
+    virtual void setFlowControlExtraBufferSize(uint32 bytes) = 0;
+
+    virtual ClassicTransactionQueue& getTransactionQueue() = 0;
+    virtual SorobanTransactionQueue& getSorobanTransactionQueue() = 0;
+
+    virtual bool sourceAccountPending(AccountID const& accountID) const = 0;
 #endif
     // a peer needs our SCP state
     virtual void sendSCPStateToPeer(uint32 ledgerSeq, Peer::pointer peer) = 0;
 
     virtual uint32_t trackingConsensusLedgerIndex() const = 0;
+    virtual uint32_t getMaxClassicTxSize() const = 0;
+    // Get maximum size of the whole transaction StellarMessage allowed by
+    // overlay
+    virtual uint32_t getMaxTxSize() const = 0;
+    virtual uint32_t getFlowControlExtraBuffer() const = 0;
 
     // return the smallest ledger number we need messages for when asking peers
     virtual uint32 getMinLedgerSeqToAskPeers() const = 0;
@@ -152,9 +179,10 @@ class Herder
     virtual bool isNewerNominationOrBallotSt(SCPStatement const& oldSt,
                                              SCPStatement const& newSt) = 0;
 
-    // Return the maximum sequence number for any tx (or 0 if none) from a given
-    // sender in the pending or recent tx sets.
-    virtual SequenceNumber getMaxSeqInPendingTxs(AccountID const&) = 0;
+    // Returns sequence number for most recent completed checkpoint that the
+    // node knows about, as derived from
+    // trackingConsensusLedgerIndex
+    virtual uint32_t getMostRecentCheckpointSeq() = 0;
 
     virtual void triggerNextLedger(uint32_t ledgerSeqToTrigger,
                                    bool forceTrackingSCP) = 0;
@@ -188,5 +216,14 @@ class Herder
                                                     bool fullKeys) = 0;
     virtual QuorumTracker::QuorumMap const&
     getCurrentlyTrackedQuorum() const = 0;
+
+    virtual size_t getMaxQueueSizeOps() const = 0;
+    virtual size_t getMaxQueueSizeSorobanOps() const = 0;
+    virtual void maybeHandleUpgrade() = 0;
+
+    virtual bool isBannedTx(Hash const& hash) const = 0;
+    virtual TransactionFrameBaseConstPtr getTx(Hash const& hash) const = 0;
+
+    virtual void beginApply() = 0;
 };
 }

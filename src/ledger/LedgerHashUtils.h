@@ -141,18 +141,37 @@ template <> class hash<stellar::LedgerKey>
             stellar::hashMix(res, std::hash<stellar::uint256>()(
                                       lk.liquidityPool().liquidityPoolID));
             break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
         case stellar::CONTRACT_DATA:
-            stellar::hashMix(res, std::hash<stellar::uint256>()(
-                                      lk.contractData().contractID));
+            switch (lk.contractData().contract.type())
+            {
+            case stellar::SC_ADDRESS_TYPE_ACCOUNT:
+                stellar::hashMix(
+                    res, std::hash<stellar::uint256>()(
+                             lk.contractData().contract.accountId().ed25519()));
+                break;
+            case stellar::SC_ADDRESS_TYPE_CONTRACT:
+                stellar::hashMix(res,
+                                 std::hash<stellar::uint256>()(
+                                     lk.contractData().contract.contractId()));
+                break;
+            }
             stellar::hashMix(
                 res, stellar::shortHash::xdrComputeHash(lk.contractData().key));
+            stellar::hashMix(
+                res, std::hash<int32_t>()(lk.contractData().durability));
+            break;
+        case stellar::CONTRACT_CODE:
+            stellar::hashMix(
+                res, std::hash<stellar::uint256>()(lk.contractCode().hash));
             break;
         case stellar::CONFIG_SETTING:
             stellar::hashMix(
                 res, std::hash<int32_t>()(lk.configSetting().configSettingID));
             break;
-#endif
+        case stellar::TTL:
+            stellar::hashMix(res,
+                             std::hash<stellar::uint256>()(lk.ttl().keyHash));
+            break;
         default:
             abort();
         }

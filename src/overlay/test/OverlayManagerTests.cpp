@@ -8,8 +8,11 @@
 
 #include "database/Database.h"
 #include "lib/catch.hpp"
+#include "overlay/FlowControl.h"
+#include "overlay/FlowControlCapacity.h"
 #include "overlay/OverlayManager.h"
 #include "overlay/OverlayManagerImpl.h"
+#include "overlay/TxAdverts.h"
 #include "test/TestAccount.h"
 #include "test/TestUtils.h"
 #include "test/TxTests.h"
@@ -30,35 +33,46 @@ namespace stellar
 class PeerStub : public Peer
 {
   public:
-    int sent = 0;
-
+    int mSent = 0;
     PeerStub(Application& app, PeerBareAddress const& address)
         : Peer(app, WE_CALLED_REMOTE)
     {
         mPeerID = SecretKey::pseudoRandomForTesting().getPublicKey();
         mState = GOT_AUTH;
         mAddress = address;
-        mOutboundCapacity = std::numeric_limits<uint32>::max();
-        mFlowControlState = Peer::FlowControlState::ENABLED;
-    }
-    virtual std::string
-    getIP() const override
-    {
-        REQUIRE(false); // should not be called
-        return {};
+        mRemoteOverlayVersion = app.getConfig().OVERLAY_PROTOCOL_VERSION;
     }
     virtual void
-    drop(std::string const&, DropDirection, DropMode) override
+    drop(std::string const&, DropDirection) override
     {
     }
     virtual void
     sendMessage(xdr::msg_ptr&& xdrBytes) override
     {
-        sent++;
+    }
+    virtual void
+    sendMessage(std::shared_ptr<StellarMessage const> msg,
+                bool log = true) override
+    {
+        mSent += static_cast<int>(OverlayManager::isFloodMessage(*msg));
     }
     virtual void
     scheduleRead() override
     {
+    }
+
+    void
+    setPullMode()
+    {
+        auto weakSelf = std::weak_ptr<Peer>(shared_from_this());
+        mTxAdverts->start(
+            [weakSelf](std::shared_ptr<StellarMessage const> msg) {
+                auto self = weakSelf.lock();
+                if (self)
+                {
+                    self->sendMessage(msg);
+                }
+            });
     }
 };
 
@@ -80,6 +94,7 @@ class OverlayManagerStub : public OverlayManagerImpl
         getPeerManager().update(address, PeerManager::BackOffUpdate::INCREASE);
 
         auto peerStub = std::make_shared<PeerStub>(mApp, address);
+        peerStub->setPullMode();
         REQUIRE(addOutboundConnection(peerStub));
         return acceptAuthenticatedPeer(peerStub);
     }
@@ -127,6 +142,7 @@ class OverlayManagerTests
         cfg.TARGET_PEER_CONNECTIONS = 5;
         cfg.KNOWN_PEERS = threePeers;
         cfg.PREFERRED_PEERS = fourPeers;
+        cfg.ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING = true;
         app = createTestApplication<ApplicationStub>(clock, cfg);
     }
 
@@ -149,7 +165,7 @@ class OverlayManagerTests
             pm.storeConfigPeers();
         }
 
-        rowset<row> rs = app->getDatabase().getSession().prepare
+        rowset<row> rs = app->getDatabase().getRawSession().prepare
                          << "SELECT ip,port,type FROM peers ORDER BY ip, port";
 
         auto& ppeers = pm.mConfigurationPreferredPeers;
@@ -197,7 +213,7 @@ class OverlayManagerTests
         pm.mResolvedPeers.wait();
         pm.tick();
 
-        rowset<row> rs = app->getDatabase().getSession().prepare
+        rowset<row> rs = app->getDatabase().getRawSession().prepare
                          << "SELECT ip,port,type FROM peers ORDER BY ip, port";
 
         int found = 0;
@@ -224,11 +240,15 @@ class OverlayManagerTests
     std::vector<int>
     sentCounts(OverlayManagerImpl& pm)
     {
+        auto getSent = [](Peer::pointer p) {
+            auto peer = static_pointer_cast<PeerStub>(p);
+            return peer->mSent;
+        };
         std::vector<int> result;
         for (auto p : pm.mInboundPeers.mAuthenticated)
-            result.push_back(static_pointer_cast<PeerStub>(p.second)->sent);
+            result.push_back(getSent(p.second));
         for (auto p : pm.mOutboundPeers.mAuthenticated)
-            result.push_back(static_pointer_cast<PeerStub>(p.second)->sent);
+            result.push_back(getSent(p.second));
         return result;
     }
 
@@ -261,33 +281,29 @@ class OverlayManagerTests
         auto c = TestAccount{*app, getAccount("c")};
         auto d = TestAccount{*app, getAccount("d")};
 
-        StellarMessage AtoB = a.tx({payment(b, 10)})->toStellarMessage();
+        auto AtoB = a.tx({payment(b, 10)})->toStellarMessage();
         auto i = 0;
         for (auto p : pm.mOutboundPeers.mAuthenticated)
         {
             if (i++ == 2)
             {
-                pm.recvFloodedMsg(AtoB, p.second);
+                pm.recvFloodedMsg(*AtoB, p.second);
             }
         }
-        pm.broadcastMessage(AtoB);
+        auto broadcastTxnMsg = [&](auto msg) {
+            pm.broadcastMessage(msg, xdrSha256(msg->transaction()));
+        };
+        broadcastTxnMsg(AtoB);
         crank(10);
         std::vector<int> expected{1, 1, 0, 1, 1};
         REQUIRE(sentCounts(pm) == expected);
-        pm.broadcastMessage(AtoB);
+        broadcastTxnMsg(AtoB);
         crank(10);
         REQUIRE(sentCounts(pm) == expected);
-        StellarMessage CtoD = c.tx({payment(d, 10)})->toStellarMessage();
-        pm.broadcastMessage(CtoD);
+        auto CtoD = c.tx({payment(d, 10)})->toStellarMessage();
+        broadcastTxnMsg(CtoD);
         crank(10);
         std::vector<int> expectedFinal{2, 2, 1, 2, 2};
-        REQUIRE(sentCounts(pm) == expectedFinal);
-
-        // Test that we updating a flood record actually prevents re-broadcast
-        StellarMessage AtoC = a.tx({payment(c, 10)})->toStellarMessage();
-        pm.updateFloodRecord(AtoB, AtoC);
-        pm.broadcastMessage(AtoC);
-        crank(10);
         REQUIRE(sentCounts(pm) == expectedFinal);
     }
 };

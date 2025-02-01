@@ -3,47 +3,35 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "bucket/BucketOutputIterator.h"
-#include "bucket/Bucket.h"
+#include "bucket/BucketIndexUtils.h"
 #include "bucket/BucketManager.h"
-#include "crypto/Random.h"
+#include "bucket/HotArchiveBucket.h"
+#include "bucket/LiveBucket.h"
+#include "ledger/LedgerTypeUtils.h"
 #include "util/GlobalChecks.h"
+#include "util/ProtocolVersion.h"
 #include <Tracy.hpp>
+#include <filesystem>
 
 namespace stellar
 {
-
-namespace
-{
-std::string
-randomBucketName(std::string const& tmpDir)
-{
-    ZoneScoped;
-    for (;;)
-    {
-        std::string name =
-            tmpDir + "/tmp-bucket-" + binToHex(randomBytes(8)) + ".xdr";
-        std::ifstream ifile(name);
-        if (!ifile)
-        {
-            return name;
-        }
-    }
-}
-}
 
 /**
  * Helper class that points to an output tempfile. Absorbs BucketEntries and
  * hashes them while writing to either destination. Produces a Bucket when done.
  */
-BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
-                                           bool keepDeadEntries,
-                                           BucketMetadata const& meta,
-                                           MergeCounters& mc,
-                                           asio::io_context& ctx, bool doFsync)
-    : mFilename(randomBucketName(tmpDir))
+template <typename BucketT>
+BucketOutputIterator<BucketT>::BucketOutputIterator(std::string const& tmpDir,
+                                                    bool keepTombstoneEntries,
+                                                    BucketMetadata const& meta,
+                                                    MergeCounters& mc,
+                                                    asio::io_context& ctx,
+                                                    bool doFsync)
+    : mFilename(BucketT::randomBucketName(tmpDir))
     , mOut(ctx, doFsync)
+    , mCtx(ctx)
     , mBuf(nullptr)
-    , mKeepDeadEntries(keepDeadEntries)
+    , mKeepTombstoneEntries(keepTombstoneEntries)
     , mMeta(meta)
     , mMergeCounters(mc)
 {
@@ -51,38 +39,102 @@ BucketOutputIterator::BucketOutputIterator(std::string const& tmpDir,
     CLOG_TRACE(Bucket, "BucketOutputIterator opening file to write: {}",
                mFilename);
     // Will throw if unable to open the file
-    mOut.open(mFilename);
+    mOut.open(mFilename.string());
 
     if (protocolVersionStartsFrom(
             meta.ledgerVersion,
-            Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY))
+            LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY))
     {
-        BucketEntry bme;
-        bme.type(METAENTRY);
-        bme.metaEntry() = mMeta;
-        put(bme);
+
+        if constexpr (std::is_same_v<BucketT, LiveBucket>)
+        {
+            BucketEntry bme;
+            bme.type(METAENTRY);
+            bme.metaEntry() = mMeta;
+            put(bme);
+        }
+        else
+        {
+            static_assert(std::is_same_v<BucketT, HotArchiveBucket>,
+                          "unexpected bucket type");
+            releaseAssertOrThrow(protocolVersionStartsFrom(
+                meta.ledgerVersion,
+                BucketT::FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION));
+
+            HotArchiveBucketEntry bme;
+            bme.type(HOT_ARCHIVE_METAENTRY);
+            bme.metaEntry() = mMeta;
+            releaseAssertOrThrow(bme.metaEntry().ext.v() == 1);
+            put(bme);
+        }
+
         mPutMeta = true;
     }
 }
 
+template <typename BucketT>
 void
-BucketOutputIterator::put(BucketEntry const& e)
+BucketOutputIterator<BucketT>::put(typename BucketT::EntryT const& e)
 {
     ZoneScoped;
-    Bucket::checkProtocolLegality(e, mMeta.ledgerVersion);
-    if (e.type() == METAENTRY)
+
+    if constexpr (std::is_same_v<BucketT, LiveBucket>)
     {
-        if (mPutMeta)
+        LiveBucket::checkProtocolLegality(e, mMeta.ledgerVersion);
+        if (e.type() == METAENTRY)
         {
-            throw std::runtime_error(
-                "putting META entry in bucket after initial entry");
+            if (mPutMeta)
+            {
+                throw std::runtime_error(
+                    "putting META entry in bucket after initial entry");
+            }
+        }
+
+        if (!mKeepTombstoneEntries && BucketT::isTombstoneEntry(e))
+        {
+            ++mMergeCounters.mOutputIteratorTombstoneElisions;
+            return;
         }
     }
-
-    if (!mKeepDeadEntries && e.type() == DEADENTRY)
+    else
     {
-        ++mMergeCounters.mOutputIteratorTombstoneElisions;
-        return;
+        static_assert(std::is_same_v<BucketT, HotArchiveBucket>,
+                      "unexpected bucket type");
+        if (e.type() == HOT_ARCHIVE_METAENTRY)
+        {
+            if (mPutMeta)
+            {
+                throw std::runtime_error(
+                    "putting META entry in bucket after initial entry");
+            }
+        }
+        else
+        {
+            if (e.type() == HOT_ARCHIVE_ARCHIVED)
+            {
+                if (!isSorobanEntry(e.archivedEntry().data))
+                {
+                    throw std::runtime_error(
+                        "putting non-soroban entry in hot archive bucket");
+                }
+            }
+            else
+            {
+                if (!isSorobanEntry(e.key()))
+                {
+                    throw std::runtime_error(
+                        "putting non-soroban entry in hot archive bucket");
+                }
+            }
+        }
+
+        // HOT_ARCHIVE_LIVE entries are dropped in the last bucket level
+        // (similar to DEADENTRY) on live BucketLists
+        if (!mKeepTombstoneEntries && BucketT::isTombstoneEntry(e))
+        {
+            ++mMergeCounters.mOutputIteratorTombstoneElisions;
+            return;
+        }
     }
 
     // Check to see if there's an existing buffered entry.
@@ -103,7 +155,7 @@ BucketOutputIterator::put(BucketEntry const& e)
     }
     else
     {
-        mBuf = std::make_unique<BucketEntry>();
+        mBuf = std::make_unique<typename BucketT::EntryT>();
     }
 
     // In any case, replace *mBuf with e.
@@ -111,9 +163,10 @@ BucketOutputIterator::put(BucketEntry const& e)
     *mBuf = e;
 }
 
-std::shared_ptr<Bucket>
-BucketOutputIterator::getBucket(BucketManager& bucketManager,
-                                MergeKey* mergeKey)
+template <typename BucketT>
+std::shared_ptr<BucketT>
+BucketOutputIterator<BucketT>::getBucket(BucketManager& bucketManager,
+                                         MergeKey* mergeKey)
 {
     ZoneScoped;
     if (mBuf)
@@ -129,14 +182,29 @@ BucketOutputIterator::getBucket(BucketManager& bucketManager,
         releaseAssert(mObjectsPut == 0);
         releaseAssert(mBytesPut == 0);
         CLOG_DEBUG(Bucket, "Deleting empty bucket file {}", mFilename);
-        std::remove(mFilename.c_str());
+        std::filesystem::remove(mFilename);
         if (mergeKey)
         {
-            bucketManager.noteEmptyMergeOutput(*mergeKey);
+            bucketManager.noteEmptyMergeOutput<BucketT>(*mergeKey);
         }
-        return std::make_shared<Bucket>();
+        return std::make_shared<BucketT>();
     }
-    return bucketManager.adoptFileAsBucket(mFilename, mHasher.finish(),
-                                           mObjectsPut, mBytesPut, mergeKey);
+
+    auto hash = mHasher.finish();
+    std::unique_ptr<typename BucketT::IndexT const> index{};
+
+    // either it's a new bucket or we just reconstructed a bucket
+    // we already have, in any case ensure we have an index
+    if (auto b = bucketManager.getBucketIfExists<BucketT>(hash);
+        !b || !b->isIndexed())
+    {
+        index = createIndex<BucketT>(bucketManager, mFilename, hash, mCtx);
+    }
+
+    return bucketManager.adoptFileAsBucket<BucketT>(mFilename.string(), hash,
+                                                    mergeKey, std::move(index));
 }
+
+template class BucketOutputIterator<LiveBucket>;
+template class BucketOutputIterator<HotArchiveBucket>;
 }
